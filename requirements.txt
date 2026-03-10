@@ -1,0 +1,44 @@
+# ===== AI 자동매매 프로그램 패키지 목록 =====
+
+# 데이터 수집
+pykrx>=1.0.45                  # 국내 주식 시세
+finance-datareader>=0.9.50      # 국내/해외 주가 데이터
+yfinance>=0.2.36                # 미국 주식 데이터
+pyupbit>=0.2.33                 # 업비트 암호화폐
+
+# 한국투자증권 API
+requests>=2.31.0                # REST API 호출
+websocket-client>=1.7.0         # WebSocket 실시간 데이터
+
+# 데이터 처리
+pandas>=2.2.0
+numpy>=1.26.0
+
+# 기술적 분석 지표
+ta>=0.11.0                      # RSI, MACD, 볼린저밴드 등
+
+# AI / 머신러닝
+openai>=1.30.0                  # GPT-4 감성분석
+scikit-learn>=1.4.0             # 머신러닝 모델
+lightgbm>=4.3.0                 # 예측 모델
+
+# 스케줄링
+APScheduler>=3.10.4             # 자동 스케줄링
+
+# 데이터베이스
+# SQLite는 Python 기본 내장
+
+# 알림
+python-telegram-bot>=21.3       # 텔레그램 알림
+
+# 시각화
+matplotlib>=3.8.0
+plotly>=5.22.0
+
+# 환경 변수
+python-dotenv>=1.0.1
+
+# 유틸리티
+pytz>=2024.1                    # 시간대 처리
+schedule>=1.2.1                 # 간단한 스케줄링
+colorlog>=6.8.2                 # 컬러 로그

@@ -1,0 +1,54 @@
+# ===== AI 자동매매 .gitignore =====
+
+# 환경변수 (API 키 포함 - 절대 커밋 금지!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# 로그 파일
+logs/*.log
+logs/*.txt
+
+# 데이터베이스
+db/*.db
+db/*.sqlite
+db/*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 임시 파일
+*.tmp
+*.bak
+
+# VM별 런타임 상태 (환경마다 다름)
+db/virtual_state.json
+
+# 분석 결과 (선택적 제외)
+db/best_params.json
