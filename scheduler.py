@@ -1,8 +1,8 @@
 """
 AI 자동매매 스케줄러 - 실시간 버전
 핵심 원칙:
-  - 신호 체크: 5분마다 (코인 24h / 주식 장중 / 미국주식 미장)
-  - 전체 스캔: 하루 3번 (새벽3시 / 장전8:50 / 미장전21:50)
+  - 신호 체크: 3분마다 (코인 24h / 주식 장중 / 미국주식 미장)
+  - 전체 스캔: 1시간마다 (종목 재선발)
   - 빠른 체크는 이미 선발된 종목만 → 30초 이내 완료
 """
 import sys
@@ -75,7 +75,7 @@ class AutoTrader:
                  max_crypto: int = 3,
                  max_kr: int = 3,
                  max_us: int = 3,
-                 signal_interval: int = 5):   # 신호 체크 주기 (분)
+                 signal_interval: int = 3):   # 신호 체크 주기 (분)
         self.dry_run         = dry_run
         self.max_crypto      = max_crypto
         self.max_kr          = max_kr
@@ -150,7 +150,7 @@ class AutoTrader:
             logger.warning(f"[가상잔고] 파일 저장 실패: {e}")
 
     # ─────────────────────────────────────────
-    # 전체 시장 스캔 (하루 3번 - 느리지만 정확)
+    # 전체 시장 스캔 (1시간마다)
     # ─────────────────────────────────────────
     def run_market_scan(self):
         """전체 시장 스캔 - 종목 재선발"""
@@ -357,7 +357,7 @@ class AutoTrader:
         ]
 
     # ─────────────────────────────────────────
-    # 실시간 신호 체크 (5분마다 - 빠름)
+    # 실시간 신호 체크 (3분마다 - 빠름)
     # ─────────────────────────────────────────
     def run_realtime_signals(self):
         """5분마다 실행 - 선발된 종목 신호만 체크"""
@@ -715,13 +715,11 @@ class AutoTrader:
     def start(self):
         """스케줄러 시작"""
 
-        # ── 핵심: 5분마다 실시간 신호 체크 ──
+        # ── 핵심: 3분마다 실시간 신호 체크 ──
         schedule.every(self.signal_interval).minutes.do(self.run_realtime_signals)
 
-        # ── 전체 스캔: 하루 3번 ──
-        schedule.every().day.at("03:00").do(self.run_market_scan)   # 새벽 코인 재스캔
-        schedule.every().day.at("08:50").do(self.run_market_scan)   # 장전 주식 스캔
-        schedule.every().day.at("21:50").do(self.run_market_scan)   # 미장 전 스캔
+        # ── 전체 스캔: 1시간마다 ──
+        schedule.every(60).minutes.do(self.run_market_scan)
 
         # ── 일일 리포트 ──
         schedule.every().day.at("08:00").do(self.send_daily_report)
@@ -729,7 +727,7 @@ class AutoTrader:
         mode = "Dry Run" if self.dry_run else "실전 매매"
         logger.info(f"스케줄 등록 완료 [{mode}]")
         logger.info(f"  실시간 신호 체크 : 매 {self.signal_interval}분")
-        logger.info(f"  전체 시장 스캔   : 03:00 / 08:50 / 21:50")
+        logger.info(f"  전체 시장 스캔   : 매 60분")
         logger.info(f"  일일 리포트      : 08:00")
         logger.info(f"  Ctrl+C 로 중단")
         logger.info("─" * 60)
@@ -757,7 +755,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="AI 자동매매 - 실시간 버전")
     parser.add_argument("--live",     action="store_true", help="실전 매매 모드")
-    parser.add_argument("--interval", type=int, default=5, help="신호 체크 주기(분), 기본 5")
+    parser.add_argument("--interval", type=int, default=3, help="신호 체크 주기(분), 기본 3")
     parser.add_argument("--max-crypto", type=int, default=3)
     parser.add_argument("--max-kr",     type=int, default=3)
     parser.add_argument("--max-us",     type=int, default=3)
