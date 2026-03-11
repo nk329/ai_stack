@@ -33,6 +33,38 @@ logger = logging.getLogger(__name__)
 KST = pytz.timezone(TIMEZONE)
 
 # ─────────────────────────────────────────
+# 실시간 환율 조회 (USD/KRW)
+# ─────────────────────────────────────────
+_usd_krw_cache = {"rate": 1450.0, "updated": None}
+
+def get_usd_krw() -> float:
+    """실시간 USD/KRW 환율 조회 (1시간 캐시)"""
+    now = datetime.now()
+    cached = _usd_krw_cache
+    # 캐시가 없거나 1시간 이상 지났으면 갱신
+    if cached["updated"] is None or (now - cached["updated"]).seconds > 3600:
+        try:
+            ticker = yf.Ticker("KRW=X")
+            rate = ticker.fast_info["last_price"]
+            if rate and 900 < rate < 2000:  # 정상 범위 체크
+                cached["rate"] = float(rate)
+                cached["updated"] = now
+                logger.info(f"[환율] USD/KRW 갱신: {rate:,.1f}원")
+        except Exception as e:
+            logger.warning(f"[환율] 조회 실패, 이전 값 사용 ({cached['rate']:,.0f}원): {e}")
+    return cached["rate"]
+
+# ─────────────────────────────────────────
+# 거래 수수료 상수
+# ─────────────────────────────────────────
+FEE_CRYPTO_BUY  = 0.0005   # 업비트 매수 수수료 0.05%
+FEE_CRYPTO_SELL = 0.0005   # 업비트 매도 수수료 0.05%
+FEE_KR_BUY      = 0.00015  # 국내주식 매수 0.015%
+FEE_KR_SELL     = 0.00195  # 국내주식 매도 0.015% + 거래세 0.18%
+FEE_US_BUY      = 0.001    # 미국주식 매수 0.1%
+FEE_US_SELL     = 0.001    # 미국주식 매도 0.1%
+
+# ─────────────────────────────────────────
 # 미국 주요 종목 (스크리너 미구현 전 기본 후보)
 # ─────────────────────────────────────────
 US_CANDIDATES = [
@@ -72,9 +104,9 @@ class AutoTrader:
     """AI 자동매매 - 실시간 모니터링 버전"""
 
     def __init__(self, dry_run: bool = True,
-                 max_crypto: int = 3,
-                 max_kr: int = 3,
-                 max_us: int = 3,
+                 max_crypto: int = 5,   # 공격적 모드: 코인 최대 5개
+                 max_kr: int = 5,       # 공격적 모드: 국내주식 최대 5개
+                 max_us: int = 5,       # 공격적 모드: 미국주식 최대 5개
                  signal_interval: int = 3):   # 신호 체크 주기 (분)
         self.dry_run         = dry_run
         self.max_crypto      = max_crypto
@@ -91,13 +123,14 @@ class AutoTrader:
         self.kis       = KISAPI()
 
         # 포트폴리오 관리자 (자본금 3등분)
+        # min_score=25: 기준 완화 → 더 많은 종목 후보 포함 (공격적 모드)
         cap3 = INITIAL_CAPITAL / 3
         self.crypto_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_crypto, min_score=40.0)
+            total_capital=cap3, max_positions=max_crypto, min_score=25.0)
         self.kr_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_kr, min_score=40.0)
+            total_capital=cap3, max_positions=max_kr, min_score=25.0)
         self.us_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_us, min_score=40.0)
+            total_capital=cap3, max_positions=max_us, min_score=25.0)
 
         # 현재 선발된 타겟 목록
         self.crypto_targets: list = []
@@ -106,7 +139,7 @@ class AutoTrader:
 
         # 쿨다운: 매도 후 동일 종목 재매수 방지 (symbol → 마지막 매도 시각)
         self._cooldown: dict = {}   # {"KRW-MON": datetime}
-        self._cooldown_minutes = 60  # 매도 후 60분 쿨다운
+        self._cooldown_minutes = 20  # 매도 후 20분 쿨다운 (공격적 모드)
 
         # Dry Run 가상 잔고 (재시작 후에도 유지 - JSON 파일로 영속 저장)
         self._vkrw_file = Path("db/virtual_state.json")
@@ -190,9 +223,9 @@ class AutoTrader:
         allocation = self.kr_portfolio.calculate_allocation(actions)
         self.kr_portfolio.print_rebalance_plan(actions, allocation)
 
-        # 백테스트 기반 최적 파라미터 v3 (AAPL/GOOGL 평균)
-        rsi_buy, rsi_sell = (40, 70) if self.dry_run else (35, 65)
-        bb_buy,  bb_sell  = (0.35, 0.65) if self.dry_run else (0.20, 0.80)
+        # 공격적 파라미터: 매수 조건 완화, 빠른 익절
+        rsi_buy, rsi_sell = (60, 75) if self.dry_run else (35, 65)
+        bb_buy,  bb_sell  = (0.60, 0.85) if self.dry_run else (0.20, 0.80)
         self.kr_targets = [
             {
                 "code":  s.symbol,
@@ -201,8 +234,8 @@ class AutoTrader:
                     rsi_oversold=rsi_buy, rsi_overbought=rsi_sell,
                     bb_buy_pct=bb_buy, bb_sell_pct=bb_sell,
                 ),
-                "stop_loss":   0.05,   # 주식 최적 손절
-                "take_profit": 0.11,   # 주식 최적 익절
+                "stop_loss":   0.05,   # 손절 5%
+                "take_profit": 0.07,   # 익절 7% (빠른 익절)
                 "score":   s.score,
                 "capital": allocation.get(s.symbol, 0),
             }
@@ -232,9 +265,9 @@ class AutoTrader:
         allocation = self.us_portfolio.calculate_allocation(actions)
         self.us_portfolio.print_rebalance_plan(actions, allocation)
 
-        # 백테스트 기반 최적 파라미터 v3 (AAPL/GOOGL 최적값)
-        rsi_buy, rsi_sell = (40, 70) if self.dry_run else (35, 65)
-        bb_buy,  bb_sell  = (0.35, 0.65) if self.dry_run else (0.20, 0.80)
+        # 공격적 파라미터: 매수 조건 완화, 빠른 익절
+        rsi_buy, rsi_sell = (60, 75) if self.dry_run else (35, 65)
+        bb_buy,  bb_sell  = (0.60, 0.85) if self.dry_run else (0.20, 0.80)
         self.us_targets = [
             {
                 "symbol":  s.symbol,
@@ -243,8 +276,8 @@ class AutoTrader:
                     rsi_oversold=rsi_buy, rsi_overbought=rsi_sell,
                     bb_buy_pct=bb_buy, bb_sell_pct=bb_sell,
                 ),
-                "stop_loss":   0.05,   # 미국주식 최적 손절
-                "take_profit": 0.11,   # 미국주식 최적 익절
+                "stop_loss":   0.05,   # 손절 5%
+                "take_profit": 0.07,   # 익절 7% (빠른 익절)
                 "score":   s.score,
                 "capital": allocation.get(s.symbol, 0),
             }
@@ -326,11 +359,10 @@ class AutoTrader:
         )
 
     def _build_crypto_targets(self, actions, allocation, scores) -> list:
-        # 백테스트 기반 최적 파라미터 v3
-        # 실전 전환 시 rsi_oversold=35, rsi_overbought=65 로 복원
+        # 공격적 파라미터: 매수 조건 완화, 익절 빠르게
         if self.dry_run:
-            rsi_buy, rsi_sell = 35, 60   # 코인 평균 최적값
-            bb_buy,  bb_sell  = 0.20, 0.65
+            rsi_buy, rsi_sell = 60, 75   # RSI 60 이하면 매수 (더 자주 진입)
+            bb_buy,  bb_sell  = 0.60, 0.85  # BB 60% 이하면 매수
         else:
             rsi_buy, rsi_sell = 35, 65
             bb_buy,  bb_sell  = 0.20, 0.80
@@ -345,8 +377,8 @@ class AutoTrader:
                     bb_buy_pct    = bb_buy,
                     bb_sell_pct   = bb_sell,
                 ),
-                "stop_loss":   0.05,   # 코인 평균 최적 손절
-                "take_profit": 0.13,   # 코인 평균 최적 익절
+                "stop_loss":   0.05,   # 손절 5%
+                "take_profit": 0.07,   # 익절 7% (빠른 익절로 거래 순환)
                 "score":   s.score,
                 "capital": allocation.get(s.symbol, 0),
             }
@@ -443,11 +475,14 @@ class AutoTrader:
             take_price = current_price * (1 + tp)
 
             if self.dry_run:
-                self.virtual_krw -= invest  # 가상 잔고 차감
-                qty = invest / current_price
+                fee   = invest * FEE_CRYPTO_BUY          # 매수 수수료
+                total = invest + fee                      # 실제 차감액 = 투자금 + 수수료
+                self.virtual_krw -= total
+                qty   = invest / current_price           # 수수료 제외한 실제 매수 수량
                 logger.info(
                     f"  [DRY-BUY]  {market} | "
                     f"가격:{current_price:>14,.0f} | 금액:{invest:>8,.0f}원 | "
+                    f"수수료:{fee:,.0f}원 | "
                     f"손절:{stop_price:>14,.0f} | 익절:{take_price:>14,.0f} | "
                     f"AI:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
                 )
@@ -456,7 +491,7 @@ class AutoTrader:
                                       stop_price, take_price, "DryRun")
                 self.db.record_trade("CRYPTO", market, "DRY-BUY", current_price, qty,
                                      strategy="DryRun",
-                                     note=f"AI:{cfg['score']:.0f}pt 가상잔고:{self.virtual_krw:,.0f}")
+                                     note=f"AI:{cfg['score']:.0f}pt fee:{fee:,.0f} 가상잔고:{self.virtual_krw:,.0f}")
                 self._save_virtual_krw()
             else:
                 result = self.upbit.buy_market_order(market, invest)
@@ -485,19 +520,21 @@ class AutoTrader:
                 sell_reason = f"전략매도 ({ret:+.2%})"
 
             if sell_reason:
-                pnl = (current_price - entry) * qty
+                gross_pnl = (current_price - entry) * qty  # 수수료 전 손익
+                sell_fee  = current_price * qty * FEE_CRYPTO_SELL  # 매도 수수료
+                pnl       = gross_pnl - sell_fee            # 수수료 반영 실현 손익
                 if self.dry_run:
-                    self.virtual_krw += entry * qty + pnl  # 가상 잔고 복구
+                    self.virtual_krw += entry * qty + gross_pnl - sell_fee  # 수수료 차감 후 복구
                     logger.info(
                         f"  [DRY-SELL] {market} | "
                         f"가격:{current_price:>14,.0f} | "
-                        f"손익:{pnl:>+10,.0f}원 | {sell_reason} "
+                        f"수수료:{sell_fee:,.0f}원 | 손익:{pnl:>+10,.0f}원 | {sell_reason} "
                         f"(가상잔고:{self.virtual_krw:,.0f}원)"
                     )
                     self.db.close_position("CRYPTO", market)
                     self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
                                          strategy="DryRun",
-                                         note=f"{sell_reason} pnl:{pnl:+,.0f}")
+                                         note=f"{sell_reason} fee:{sell_fee:,.0f} pnl:{pnl:+,.0f}")
                     self.risk.record_trade_result(pnl)
                     self._save_virtual_krw()
                     # 쿨다운 등록 (60분간 재매수 금지)
@@ -549,11 +586,14 @@ class AutoTrader:
             take_price = int(current_price * (1 + tp))
 
             if self.dry_run:
-                invest = qty * current_price
-                self.virtual_krw -= invest
+                invest    = qty * current_price
+                fee       = invest * FEE_KR_BUY           # 매수 수수료 0.015%
+                total     = invest + fee
+                self.virtual_krw -= total
                 logger.info(
                     f"  [DRY-BUY]  {name}({code}) | "
                     f"가격:{current_price:>8,}원 | {qty}주 | "
+                    f"수수료:{fee:,.0f}원 | "
                     f"손절:{stop_price:,} | 익절:{take_price:,} | "
                     f"AI:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
                 )
@@ -561,7 +601,7 @@ class AutoTrader:
                                       stop_price, take_price, "DryRun")
                 self.db.record_trade("KR", code, "DRY-BUY", current_price, qty,
                                      strategy="DryRun",
-                                     note=f"AI:{cfg['score']:.0f}pt {name}")
+                                     note=f"AI:{cfg['score']:.0f}pt fee:{fee:,.0f} {name}")
                 self._save_virtual_krw()
 
         elif position:
@@ -580,19 +620,21 @@ class AutoTrader:
                 sell_reason = f"전략매도 ({ret:+.2%})"
 
             if sell_reason:
-                pnl = (current_price - entry) * qty
+                gross_pnl = (current_price - entry) * qty
+                sell_fee  = current_price * qty * FEE_KR_SELL  # 매도 수수료 + 거래세 0.195%
+                pnl       = gross_pnl - sell_fee
                 if self.dry_run:
-                    self.virtual_krw += entry * qty + pnl
+                    self.virtual_krw += entry * qty + gross_pnl - sell_fee
                     logger.info(
                         f"  [DRY-SELL] {name}({code}) | "
                         f"가격:{current_price:>8,}원 | "
-                        f"손익:{pnl:>+10,.0f}원 | {sell_reason} "
+                        f"수수료:{sell_fee:,.0f}원 | 손익:{pnl:>+10,.0f}원 | {sell_reason} "
                         f"(가상잔고:{self.virtual_krw:,.0f}원)"
                     )
                     self.db.close_position("KR", code)
                     self.db.record_trade("KR", code, "DRY-SELL", current_price, qty,
                                          strategy="DryRun",
-                                         note=f"{sell_reason} pnl:{pnl:+,.0f} {name}")
+                                         note=f"{sell_reason} fee:{sell_fee:,.0f} pnl:{pnl:+,.0f} {name}")
                     self.risk.record_trade_result(pnl)
                     self._save_virtual_krw()
                 else:
@@ -629,9 +671,17 @@ class AutoTrader:
         position = self.db.get_position("US", symbol)
 
         if signal.signal == Signal.BUY and not position:
-            budget = cfg.get("capital") or self.risk.calc_position_size(current_price)
-            # 미국주식은 소수점 주문 불가 → 1주 단위
-            qty = max(1, int(budget / current_price))
+            # 실시간 환율로 예산을 달러로 환산 후 수량 계산
+            usd_krw    = get_usd_krw()
+            budget_krw = cfg.get("capital") or self.risk.calc_position_size(current_price * usd_krw)
+            budget_usd = budget_krw / usd_krw              # 원화 예산 → 달러 환산
+            qty        = int(budget_usd / current_price)   # 살 수 있는 주수
+            if qty < 1:
+                logger.info(
+                    f"  [{symbol}] 예산 부족으로 매수 불가 "
+                    f"(예산:{budget_krw:,.0f}원=${budget_usd:.1f}, 주가:${current_price:.2f})"
+                )
+                return
             stop_price = current_price * (1 - sl)
             take_price = current_price * (1 + tp)
 
@@ -643,19 +693,31 @@ class AutoTrader:
                     logger.info(f"  [{symbol}] 쿨다운 중 ({remain}분 후 재매수 가능)")
                     return
 
-                invest = qty * current_price
+                invest_usd = qty * current_price
+                fee_usd    = invest_usd * FEE_US_BUY           # 매수 수수료 0.1%
+                total_usd  = invest_usd + fee_usd
+                total_krw  = total_usd * usd_krw               # 원화 환산 (수수료 포함)
+
+                # 가용 잔고 확인
+                if total_krw > self.virtual_krw:
+                    logger.info(f"  [{symbol}] 잔고 부족 (필요:{total_krw:,.0f}원, 가용:{self.virtual_krw:,.0f}원)")
+                    return
+
+                self.virtual_krw -= total_krw
                 logger.info(
                     f"  [DRY-BUY]  {name}({symbol}) | "
-                    f"${current_price:>8,.2f} | {qty}주 | "
+                    f"${current_price:>8,.2f} ({usd_krw:,.0f}원/달러) | {qty}주 | "
+                    f"수수료:${fee_usd:.2f} | 원화:{total_krw:,.0f}원 | "
                     f"손절:${stop_price:,.2f} | 익절:${take_price:,.2f} | "
-                    f"AI:{cfg['score']:.0f}pt"
+                    f"AI:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
                 )
                 try:
                     self.db.open_position("US", symbol, current_price, qty,
                                           stop_price, take_price, "DryRun")
                     self.db.record_trade("US", symbol, "DRY-BUY", current_price, qty,
                                          strategy="DryRun",
-                                         note=f"AI:{cfg['score']:.0f}pt {name}")
+                                         note=f"AI:{cfg['score']:.0f}pt {name} rate:{usd_krw:.0f} krw:{total_krw:,.0f}")
+                    self._save_virtual_krw()
                     # 쿨다운 등록 (매수 후에도 재매수 방지)
                     from datetime import timedelta
                     self._cooldown[symbol] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
@@ -681,18 +743,29 @@ class AutoTrader:
                 sell_reason = f"전략매도 ({ret:+.2%})"
 
             if sell_reason:
-                pnl = (current_price - entry) * qty
+                usd_krw   = get_usd_krw()
+                gross_pnl_usd = (current_price - entry) * qty
+                sell_fee_usd  = current_price * qty * FEE_US_SELL   # 매도 수수료 0.1%
+                pnl_usd       = gross_pnl_usd - sell_fee_usd
+                pnl_krw       = pnl_usd * usd_krw                   # 원화 환산 손익
                 if self.dry_run:
+                    # 매도 수익 원화로 잔고 복구
+                    sell_amount_krw = (entry * qty + gross_pnl_usd - sell_fee_usd) * usd_krw
+                    self.virtual_krw += sell_amount_krw
                     logger.info(
                         f"  [DRY-SELL] {name}({symbol}) | "
-                        f"${current_price:>8,.2f} | "
-                        f"손익:${pnl:>+10,.2f} | {sell_reason}"
+                        f"${current_price:>8,.2f} ({usd_krw:,.0f}원/달러) | "
+                        f"수수료:${sell_fee_usd:.2f} | 손익:{pnl_krw:>+,.0f}원 | {sell_reason} "
+                        f"(가상잔고:{self.virtual_krw:,.0f}원)"
                     )
                     self.db.close_position("US", symbol)
                     self.db.record_trade("US", symbol, "DRY-SELL", current_price, qty,
                                          strategy="DryRun",
-                                         note=f"{sell_reason} pnl:{pnl:+,.2f}")
-                    self.risk.record_trade_result(pnl)
+                                         note=f"{sell_reason} rate:{usd_krw:.0f} fee:{sell_fee_usd:.2f} pnl:{pnl_krw:+,.0f}")
+                    self.risk.record_trade_result(pnl_krw)
+                    self._save_virtual_krw()
+                    from datetime import timedelta
+                    self._cooldown[symbol] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
             else:
                 logger.info(
                     f"  [HOLD] {name}({symbol}) | "

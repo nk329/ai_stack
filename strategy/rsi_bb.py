@@ -69,8 +69,8 @@ class RSIBollingerStrategy(BaseStrategy):
         sell_score = sum(sell_conditions.values())
 
         # ── 신호 결정 ──────────────────────────────
-        # 매수: 3개 조건 중 2개 이상 충족
-        if buy_score >= 2:
+        # 매수: 3개 조건 중 1개 이상 충족 (공격적 모드 - 더 자주 매수)
+        if buy_score >= 1:
             reasons = [k for k, v in buy_conditions.items() if v]
             confidence = buy_score / 3
             return self._make_signal(
