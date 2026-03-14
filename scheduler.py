@@ -21,6 +21,7 @@ from config.settings import INITIAL_CAPITAL, TIMEZONE
 from data.collector import DataCollector
 from data.screener import AIScreener
 from strategy.rsi_bb import RSIBollingerStrategy
+from strategy.pattern_strategy import PatternStrategy
 from strategy.portfolio import DynamicPortfolio
 from strategy.base import Signal, Market
 from risk.manager import RiskManager
@@ -104,9 +105,9 @@ class AutoTrader:
     """AI 자동매매 - 실시간 모니터링 버전"""
 
     def __init__(self, dry_run: bool = True,
-                 max_crypto: int = 5,   # 공격적 모드: 코인 최대 5개
-                 max_kr: int = 5,       # 공격적 모드: 국내주식 최대 5개
-                 max_us: int = 5,       # 공격적 모드: 미국주식 최대 5개
+                 max_crypto: int = 10,  # 코인 최대 10개
+                 max_kr: int = 5,
+                 max_us: int = 3,
                  signal_interval: int = 3):   # 신호 체크 주기 (분)
         self.dry_run         = dry_run
         self.max_crypto      = max_crypto
@@ -122,15 +123,16 @@ class AutoTrader:
         self.upbit     = UpbitAPI()
         self.kis       = KISAPI()
 
-        # 포트폴리오 관리자 (자본금 3등분)
-        # min_score=25: 기준 완화 → 더 많은 종목 후보 포함 (공격적 모드)
-        cap3 = INITIAL_CAPITAL / 3
+        # 포트폴리오 관리자
+        # total_capital을 크게 잡고 포지션당 실제 투자금은 virtual_krw로 동적 결정
+        self.per_position_krw = 5000   # 포지션당 투자금 (원) - 가용 잔고에서 이 금액씩 투자
+        large_cap = INITIAL_CAPITAL * 10  # 할당 계산용 (실제 투자금은 per_position_krw 기준)
         self.crypto_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_crypto, min_score=25.0)
+            total_capital=large_cap, max_positions=max_crypto, min_score=25.0)
         self.kr_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_kr, min_score=25.0)
+            total_capital=large_cap, max_positions=max_kr, min_score=25.0)
         self.us_portfolio = DynamicPortfolio(
-            total_capital=cap3, max_positions=max_us, min_score=25.0)
+            total_capital=large_cap, max_positions=max_us, min_score=25.0)
 
         # 현재 선발된 타겟 목록
         self.crypto_targets: list = []
@@ -141,6 +143,13 @@ class AutoTrader:
         self._cooldown: dict = {}   # {"KRW-MON": datetime}
         self._cooldown_minutes = 20  # 매도 후 20분 쿨다운 (공격적 모드)
 
+        # 트레일링 스탑: 보유 중 최고가 추적 {market: max_price}
+        self._max_price: dict = {}
+        self._trailing_pct   = 0.04   # 최고가 대비 -4% 손절
+
+        # 시간 기반 탈출: 보유 X일 이상 & 수익 없으면 매도
+        self._time_exit_days = 5      # 5일 이상 보유 & 수익률 0% 미만 → 매도
+
         # Dry Run 가상 잔고 (재시작 후에도 유지 - JSON 파일로 영속 저장)
         self._vkrw_file = Path("db/virtual_state.json")
         self.virtual_krw: float = self._load_virtual_krw()
@@ -150,7 +159,7 @@ class AutoTrader:
         logger.info(f"  AI 자동매매 시작 [{mode}]")
         logger.info(f"  초기 자본금 : {INITIAL_CAPITAL:,.0f}원")
         logger.info(f"  신호 체크   : 매 {signal_interval}분")
-        logger.info(f"  대상 시장   : 코인(24h) / 국내주식(장중) / 미국주식(미장)")
+        logger.info(f"  대상 시장   : 코인 전용 (24h 상시 매매)")
         logger.info("=" * 60)
 
     # ─────────────────────────────────────────
@@ -193,12 +202,12 @@ class AutoTrader:
         # 코인 스캔 (항상)
         self._scan_crypto()
 
-        # 주식 스캔 (장 시간대에 맞게)
-        kr_time = datetime.now(KST)
-        if 8 <= kr_time.hour < 16:
-            self._scan_kr_stocks()
-        elif kr_time.hour >= 21 or kr_time.hour < 7:
-            self._scan_us_stocks()
+        # 주식 스캔 비활성화 (코인 전략 집중)
+        # kr_time = datetime.now(KST)
+        # if 8 <= kr_time.hour < 16:
+        #     self._scan_kr_stocks()
+        # elif kr_time.hour >= 21 or kr_time.hour < 7:
+        #     self._scan_us_stocks()
 
         logger.info(f"[{now}] ════ 스캔 완료 ════")
 
@@ -359,26 +368,18 @@ class AutoTrader:
         )
 
     def _build_crypto_targets(self, actions, allocation, scores) -> list:
-        # 공격적 파라미터: 매수 조건 완화, 익절 빠르게
-        if self.dry_run:
-            rsi_buy, rsi_sell = 60, 75   # RSI 60 이하면 매수 (더 자주 진입)
-            bb_buy,  bb_sell  = 0.60, 0.85  # BB 60% 이하면 매수
-        else:
-            rsi_buy, rsi_sell = 35, 65
-            bb_buy,  bb_sell  = 0.20, 0.80
+        # 차트 패턴 전략 (이미지 분석 기반)
+        # 매수: 쌍바닥+핀버+MA추세+거래량+피보나치 점수제 (55점 이상)
+        # 매도: 쌍봉+흑삼병+급락캔들+MA하향 즉시 매도
+        pattern_strat = PatternStrategy(buy_score_threshold=55.0)
 
         return [
             {
-                "market":  s.symbol,
-                "name":    s.name,
-                "strategy": RSIBollingerStrategy(
-                    rsi_oversold  = rsi_buy,
-                    rsi_overbought= rsi_sell,
-                    bb_buy_pct    = bb_buy,
-                    bb_sell_pct   = bb_sell,
-                ),
-                "stop_loss":   0.05,   # 손절 5%
-                "take_profit": 0.07,   # 익절 7% (빠른 익절로 거래 순환)
+                "market":   s.symbol,
+                "name":     s.name,
+                "strategy": pattern_strat,
+                "stop_loss":   0.05,   # 고정 손절 5% (트레일링 스탑과 병행)
+                "take_profit": 0.08,   # 익절 8%
                 "score":   s.score,
                 "capital": allocation.get(s.symbol, 0),
             }
@@ -407,31 +408,9 @@ class AutoTrader:
             logger.info(f"[{now}] 코인 타겟 없음 → 스캔 실행")
             self._scan_crypto()
 
-        # 국내주식: 장중에만
-        if is_kr_market_open():
-            if self.kr_targets:
-                logger.info(f"[{now}] ── 국내주식 신호 체크 ──")
-                for cfg in self.kr_targets:
-                    try:
-                        self._process_kr_stock(cfg)
-                    except Exception as e:
-                        logger.error(f"[{cfg['code']}] 오류: {e}")
-            else:
-                logger.info(f"[{now}] 주식 타겟 없음 → 스캔 실행")
-                self._scan_kr_stocks()
-
-        # 미국주식: 미장 시간에만
-        if is_us_market_open():
-            if self.us_targets:
-                logger.info(f"[{now}] ── 미국주식 신호 체크 ──")
-                for cfg in self.us_targets:
-                    try:
-                        self._process_us_stock(cfg)
-                    except Exception as e:
-                        logger.error(f"[{cfg['symbol']}] 오류: {e}")
-            else:
-                logger.info(f"[{now}] 미국주식 타겟 없음 → 스캔 실행")
-                self._scan_us_stocks()
+        # 국내주식 / 미국주식 비활성화 (코인 전략 집중)
+        # if is_kr_market_open(): ...
+        # if is_us_market_open(): ...
 
     # ─────────────────────────────────────────
     # 개별 종목 매매 처리
@@ -465,10 +444,10 @@ class AutoTrader:
                 krw = self.virtual_krw
             else:
                 krw = self.upbit.get_krw_balance()
-            budget = cfg.get("capital") or self.risk.calc_position_size(current_price)
-            invest = min(budget, krw * 0.95)
+            # 포지션당 고정 투자금 사용 (가용 잔고 내에서)
+            invest = min(self.per_position_krw, krw * 0.95)
             if invest < 5000:
-                logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원)")
+                logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원, 필요:5,000원)")
                 return
 
             stop_price = current_price * (1 - sl)
@@ -484,14 +463,15 @@ class AutoTrader:
                     f"가격:{current_price:>14,.0f} | 금액:{invest:>8,.0f}원 | "
                     f"수수료:{fee:,.0f}원 | "
                     f"손절:{stop_price:>14,.0f} | 익절:{take_price:>14,.0f} | "
-                    f"AI:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
+                    f"패턴점수:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
                 )
                 # Dry Run: DB에 포지션 + 거래 기록 모두 저장
                 self.db.open_position("CRYPTO", market, current_price, qty,
-                                      stop_price, take_price, "DryRun")
+                                      stop_price, take_price, "PatternStrategy")
                 self.db.record_trade("CRYPTO", market, "DRY-BUY", current_price, qty,
-                                     strategy="DryRun",
-                                     note=f"AI:{cfg['score']:.0f}pt fee:{fee:,.0f} 가상잔고:{self.virtual_krw:,.0f}")
+                                     strategy="PatternStrategy",
+                                     note=f"패턴:{cfg['score']:.0f}pt fee:{fee:,.0f} 가상잔고:{self.virtual_krw:,.0f}")
+                self._max_price[market] = current_price  # 최고가 초기화
                 self._save_virtual_krw()
             else:
                 result = self.upbit.buy_market_order(market, invest)
@@ -511,13 +491,35 @@ class AutoTrader:
             take_p = float(position.get("take_profit") or entry * (1 + tp))
             ret    = (current_price - entry) / entry
 
+            # 트레일링 스탑: 최고가 갱신 및 추적
+            prev_max = self._max_price.get(market, entry)
+            if current_price > prev_max:
+                self._max_price[market] = current_price
+                prev_max = current_price
+            trailing_stop = prev_max * (1 - self._trailing_pct)
+
+            # 시간 기반 탈출: 보유일 계산
+            days_held = 0
+            try:
+                from datetime import timedelta as td
+                entry_date = datetime.strptime(
+                    position.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=KST)
+                days_held = (datetime.now(KST) - entry_date).days
+            except Exception:
+                pass
+
             sell_reason = ""
-            if current_price <= stop_p:
-                sell_reason = f"손절 ({ret:+.2%})"
+            if current_price <= trailing_stop and ret > -sl:
+                sell_reason = f"트레일링스탑 ({ret:+.2%}, 최고가대비-{self._trailing_pct:.0%})"
+            elif current_price <= stop_p:
+                sell_reason = f"고정손절 ({ret:+.2%})"
             elif current_price >= take_p:
                 sell_reason = f"익절 ({ret:+.2%})"
             elif signal.signal == Signal.SELL:
-                sell_reason = f"전략매도 ({ret:+.2%})"
+                sell_reason = f"패턴매도 ({ret:+.2%})"
+            elif days_held >= self._time_exit_days and ret < 0:
+                sell_reason = f"시간탈출 ({days_held}일보유, {ret:+.2%})"
 
             if sell_reason:
                 gross_pnl = (current_price - entry) * qty  # 수수료 전 손익
@@ -533,11 +535,11 @@ class AutoTrader:
                     )
                     self.db.close_position("CRYPTO", market)
                     self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
-                                         strategy="DryRun",
+                                         strategy="PatternStrategy",
                                          note=f"{sell_reason} fee:{sell_fee:,.0f} pnl:{pnl:+,.0f}")
                     self.risk.record_trade_result(pnl)
                     self._save_virtual_krw()
-                    # 쿨다운 등록 (60분간 재매수 금지)
+                    self._max_price.pop(market, None)  # 최고가 초기화
                     from datetime import timedelta
                     self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     logger.info(f"  [{market}] 쿨다운 시작 ({self._cooldown_minutes}분)")
@@ -554,10 +556,12 @@ class AutoTrader:
                         logger.info(f"  [SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
                         from datetime import timedelta
                         self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
+                        self._max_price.pop(market, None)
             else:
                 logger.info(
                     f"  [HOLD] {market} | "
-                    f"현재:{current_price:>14,.0f} | 수익률:{ret:>+7.2%}"
+                    f"현재:{current_price:>14,.0f} | 수익률:{ret:>+7.2%} | "
+                    f"트레일:{trailing_stop:>14,.0f} | {days_held}일보유"
                 )
 
     def _process_kr_stock(self, cfg: dict):
@@ -578,9 +582,10 @@ class AutoTrader:
         position = self.db.get_position("KR", code)
 
         if signal.signal == Signal.BUY and not position:
-            budget = cfg.get("capital") or self.risk.calc_position_size(current_price)
-            qty    = int(budget / current_price)
+            invest = min(self.per_position_krw, self.virtual_krw * 0.95)
+            qty    = int(invest / current_price)
             if qty < 1:
+                logger.info(f"  [{code}] 1주 매수 불가 (주가:{current_price:,}원 > 예산:{invest:,.0f}원)")
                 return
             stop_price = int(current_price * (1 - sl))
             take_price = int(current_price * (1 + tp))
@@ -671,9 +676,9 @@ class AutoTrader:
         position = self.db.get_position("US", symbol)
 
         if signal.signal == Signal.BUY and not position:
-            # 실시간 환율로 예산을 달러로 환산 후 수량 계산
+            # per_position_krw 원화 예산을 실시간 환율로 달러 환산 후 수량 계산
             usd_krw    = get_usd_krw()
-            budget_krw = cfg.get("capital") or self.risk.calc_position_size(current_price * usd_krw)
+            budget_krw = min(self.per_position_krw, self.virtual_krw * 0.95)
             budget_usd = budget_krw / usd_krw              # 원화 예산 → 달러 환산
             qty        = int(budget_usd / current_price)   # 살 수 있는 주수
             if qty < 1:
