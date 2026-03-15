@@ -19,6 +19,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+def fmt_price(value) -> str:
+    """가격 크기에 따라 소수점 자릿수 자동 조정 (0.000515 → 0.000515, 92.8 → 92.80)"""
+    try:
+        v = float(value)
+        if v == 0:
+            return "0"
+        if v >= 1000:
+            return f"{v:,.0f}"
+        if v >= 1:
+            return f"{v:,.2f}"
+        if v >= 0.01:
+            return f"{v:.4f}"
+        if v >= 0.0001:
+            return f"{v:.6f}"
+        return f"{v:.8f}"
+    except Exception:
+        return str(value)
+
+app.jinja_env.globals["fmt_price"] = fmt_price
 app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "ai_stock_secret")
 
 DB_FILE         = Path("db/trading.db")
@@ -351,10 +371,10 @@ DASHBOARD_HTML = """
         <tr>
           <td><span class="badge badge-hold">{{ p.market }}</span></td>
           <td><strong>{{ p.symbol }}</strong></td>
-          <td>{{ "{:,.2f}".format(p.entry_price|float) }}</td>
+          <td>{{ fmt_price(p.entry_price) }}</td>
           <td>{{ "{:.4f}".format(p.quantity|float) }}</td>
-          <td class="pnl-neg">{{ "{:,.2f}".format(p.stop_loss|float if p.stop_loss else 0) }}</td>
-          <td class="pnl-pos">{{ "{:,.2f}".format(p.take_profit|float if p.take_profit else 0) }}</td>
+          <td class="pnl-neg">{{ fmt_price(p.stop_loss if p.stop_loss else 0) }}</td>
+          <td class="pnl-pos">{{ fmt_price(p.take_profit if p.take_profit else 0) }}</td>
           <td style="color:#94a3b8;font-size:.78rem">{{ p.entry_date }}</td>
         </tr>
         {% endfor %}
@@ -387,7 +407,7 @@ DASHBOARD_HTML = """
           </td>
           <td>{{ t.market }}</td>
           <td><strong>{{ t.symbol }}</strong></td>
-          <td>{{ "{:,.2f}".format(t.price|float) }}</td>
+          <td>{{ fmt_price(t.price) }}</td>
           <td>
             {% if "SELL" in t.side %}
               <span class="{{ 'pnl-pos' if pnl >= 0 else 'pnl-neg' }}">
