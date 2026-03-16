@@ -393,18 +393,41 @@ class AutoTrader:
     # 실시간 신호 체크 (3분마다 - 빠름)
     # ─────────────────────────────────────────
     def run_realtime_signals(self):
-        """5분마다 실행 - 선발된 종목 신호만 체크"""
+        """3분마다 실행 - 선발된 종목 + 기존 보유 포지션 신호 체크"""
         now = datetime.now(KST).strftime("%H:%M")
 
-        # 코인은 24시간 항상
-        if self.crypto_targets:
-            for cfg in self.crypto_targets:
+        # ── 기존 보유 포지션 심볼 수집 (타겟 미선발이어도 항상 체크) ──
+        open_positions = [p for p in self.db.get_positions() if p.get("market") == "CRYPTO"]
+        open_symbols   = {p["symbol"] for p in open_positions}
+
+        # crypto_targets 심볼
+        target_symbols = {cfg["market"] for cfg in self.crypto_targets}
+
+        # 포지션은 있지만 타겟에 없는 종목 → 모니터링 전용 cfg 추가
+        pattern_strat = PatternStrategy(buy_score_threshold=55.0)
+        extra_cfgs = [
+            {
+                "market":      sym,
+                "name":        sym,
+                "strategy":    pattern_strat,
+                "stop_loss":   0.05,
+                "take_profit": 0.08,
+                "score":       0,
+                "capital":     0,
+            }
+            for sym in open_symbols if sym not in target_symbols
+        ]
+
+        all_cfgs = self.crypto_targets + extra_cfgs
+
+        if all_cfgs:
+            for cfg in all_cfgs:
                 try:
                     self._process_crypto(cfg)
                 except Exception as e:
                     logger.error(f"[{cfg['market']}] 오류: {e}")
         else:
-            # 타겟 없으면 스캔 먼저
+            # 타겟도 포지션도 없으면 스캔 먼저
             logger.info(f"[{now}] 코인 타겟 없음 → 스캔 실행")
             self._scan_crypto()
 
