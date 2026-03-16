@@ -104,6 +104,66 @@ def get_usd_krw() -> float:
     return 1450.0
 
 
+def get_current_prices(positions: list) -> dict:
+    """업비트에서 오픈 포지션 현재가 일괄 조회 {symbol: current_price}"""
+    prices = {}
+    crypto_symbols = [p["symbol"] for p in positions if p.get("market") == "CRYPTO"]
+    if not crypto_symbols:
+        return prices
+    try:
+        import pyupbit
+        # 한 번에 여러 종목 현재가 조회
+        tickers = pyupbit.get_tickers(fiat="KRW")
+        markets  = ",".join(crypto_symbols)
+        result   = pyupbit.get_current_price(markets)
+        if isinstance(result, dict):
+            prices.update(result)
+        elif isinstance(result, (int, float)):
+            # 단일 종목 결과
+            if crypto_symbols:
+                prices[crypto_symbols[0]] = float(result)
+    except Exception:
+        pass
+    return prices
+
+
+def enrich_positions(positions: list) -> list:
+    """오픈 포지션에 현재가 + 미실현 손익 정보 추가"""
+    current_prices = get_current_prices(positions)
+    enriched = []
+    for p in positions:
+        p = dict(p)
+        symbol        = p.get("symbol", "")
+        entry_price   = float(p.get("entry_price") or 0)
+        qty           = float(p.get("quantity") or 0)
+        current_price = current_prices.get(symbol)
+
+        if current_price and entry_price > 0:
+            pnl_pct  = (current_price - entry_price) / entry_price * 100
+            pnl_amt  = (current_price - entry_price) * qty
+            p["current_price"] = current_price
+            p["pnl_pct"]       = pnl_pct
+            p["pnl_amt"]       = pnl_amt
+            # 손절/익절 도달 여부
+            stop_p = float(p.get("stop_loss") or 0)
+            take_p = float(p.get("take_profit") or 0)
+            if stop_p and current_price <= stop_p:
+                p["status"] = "danger"   # 손절 근처
+            elif take_p and current_price >= take_p:
+                p["status"] = "profit"   # 익절 근처
+            elif pnl_pct < 0:
+                p["status"] = "loss"
+            else:
+                p["status"] = "gain"
+        else:
+            p["current_price"] = None
+            p["pnl_pct"]       = None
+            p["pnl_amt"]       = None
+            p["status"]        = "unknown"
+        enriched.append(p)
+    return enriched
+
+
 def get_invested(positions) -> float:
     """오픈 포지션의 총 투자금액 계산 (미국주식은 실시간 환율로 원화 환산)"""
     usd_krw = get_usd_krw()
@@ -364,15 +424,39 @@ DASHBOARD_HTML = """
     {% if positions %}
     <table>
       <thead>
-        <tr><th>시장</th><th>종목</th><th>진입가</th><th>수량</th><th>손절가</th><th>익절가</th><th>진입일시</th></tr>
+        <tr>
+          <th>시장</th><th>종목</th><th>진입가</th><th>현재가</th>
+          <th>미실현손익</th><th>수익률</th><th>손절가</th><th>익절가</th><th>진입일시</th>
+        </tr>
       </thead>
       <tbody>
         {% for p in positions %}
-        <tr>
+        {% set status = p.status %}
+        <tr style="{% if status == 'danger' %}background:rgba(239,68,68,.07){% elif status == 'profit' %}background:rgba(34,197,94,.07){% endif %}">
           <td><span class="badge badge-hold">{{ p.market }}</span></td>
           <td><strong>{{ p.symbol }}</strong></td>
           <td>{{ fmt_price(p.entry_price) }}</td>
-          <td>{{ "{:.4f}".format(p.quantity|float) }}</td>
+          <td>
+            {% if p.current_price %}
+              <strong>{{ fmt_price(p.current_price) }}</strong>
+            {% else %}
+              <span style="color:#94a3b8">-</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if p.pnl_amt is not none %}
+              <span class="{{ 'pnl-pos' if p.pnl_amt >= 0 else 'pnl-neg' }}">
+                {{ "+" if p.pnl_amt >= 0 else "" }}{{ "{:,.0f}".format(p.pnl_amt) }}원
+              </span>
+            {% else %}-{% endif %}
+          </td>
+          <td>
+            {% if p.pnl_pct is not none %}
+              <strong class="{{ 'pnl-pos' if p.pnl_pct >= 0 else 'pnl-neg' }}">
+                {{ "+" if p.pnl_pct >= 0 else "" }}{{ "{:.2f}".format(p.pnl_pct) }}%
+              </strong>
+            {% else %}-{% endif %}
+          </td>
           <td class="pnl-neg">{{ fmt_price(p.stop_loss if p.stop_loss else 0) }}</td>
           <td class="pnl-pos">{{ fmt_price(p.take_profit if p.take_profit else 0) }}</td>
           <td style="color:#94a3b8;font-size:.78rem">{{ p.entry_date }}</td>
@@ -512,7 +596,7 @@ def logout():
 @login_required
 def index():
     trades    = get_trades()
-    positions = get_positions()
+    positions = enrich_positions(get_positions())
     s         = get_summary(trades, positions)   # positions 전달 → 투자금 계산
     now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return render_template_string(
