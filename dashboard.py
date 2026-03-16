@@ -112,18 +112,29 @@ def get_current_prices(positions: list) -> dict:
         return prices
     try:
         import pyupbit
-        # 한 번에 여러 종목 현재가 조회
-        tickers = pyupbit.get_tickers(fiat="KRW")
-        markets  = ",".join(crypto_symbols)
-        result   = pyupbit.get_current_price(markets)
-        if isinstance(result, dict):
-            prices.update(result)
-        elif isinstance(result, (int, float)):
-            # 단일 종목 결과
-            if crypto_symbols:
+        if len(crypto_symbols) == 1:
+            # 단일 종목: float 반환
+            result = pyupbit.get_current_price(crypto_symbols[0])
+            if result:
                 prices[crypto_symbols[0]] = float(result)
+        else:
+            # 복수 종목: 리스트로 넘겨야 dict 반환
+            result = pyupbit.get_current_price(crypto_symbols)
+            if isinstance(result, dict):
+                prices.update({k: float(v) for k, v in result.items() if v is not None})
     except Exception:
-        pass
+        # 일괄 조회 실패 시 종목별 개별 조회
+        try:
+            import pyupbit
+            for symbol in crypto_symbols:
+                try:
+                    price = pyupbit.get_current_price(symbol)
+                    if price:
+                        prices[symbol] = float(price)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return prices
 
 
