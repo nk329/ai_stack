@@ -57,9 +57,10 @@ class PatternStrategy(BaseStrategy):
         last_two = local_mins[-2:]
         p1, p2   = last_two[0][1], last_two[1][1]
         diff     = abs(p1 - p2) / max(p1, p2)
-        # 두 저점 사이에 고점이 있어야 함 (V-V 형태)
+        # 두 저점 사이에 고점이 있어야 함 (V-V 형태) → high 컬럼 사용
         idx1, idx2  = last_two[0][0], last_two[1][0]
-        mid_high    = lows[idx1:idx2+1].max()
+        highs_slice = df["high"].iloc[-window:].values
+        mid_high    = highs_slice[idx1:idx2+1].max()
         is_v_shape  = mid_high > max(p1, p2) * 1.02
         return diff < tolerance and is_v_shape
 
@@ -77,10 +78,11 @@ class PatternStrategy(BaseStrategy):
         last_two = local_maxs[-2:]
         p1, p2   = last_two[0][1], last_two[1][1]
         diff     = abs(p1 - p2) / max(p1, p2)
-        # 두 고점 사이에 저점이 있어야 함
-        idx1, idx2 = last_two[0][0], last_two[1][0]
-        mid_low    = highs[idx1:idx2+1].min()
-        is_m_shape = mid_low < min(p1, p2) * 0.98
+        # 두 고점 사이에 저점이 있어야 함 → low 컬럼 사용
+        idx1, idx2  = last_two[0][0], last_two[1][0]
+        lows_slice  = df["low"].iloc[-window:].values
+        mid_low     = lows_slice[idx1:idx2+1].min()
+        is_m_shape  = mid_low < min(p1, p2) * 0.98
         return diff < tolerance and is_m_shape
 
     def _is_pin_bar(self, candle: pd.Series, min_wick_ratio: float = 2.0) -> bool:

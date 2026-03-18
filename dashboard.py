@@ -92,16 +92,23 @@ def parse_pnl(note: str, amount: float) -> float:
     return 0.0
 
 
+_dash_usd_cache: dict = {"rate": 1450.0, "updated": None}
+
 def get_usd_krw() -> float:
-    """실시간 USD/KRW 환율 (yfinance, 실패 시 1450 기본값)"""
-    try:
-        import yfinance as yf
-        rate = yf.Ticker("KRW=X").fast_info["last_price"]
-        if rate and 900 < rate < 2000:
-            return float(rate)
-    except Exception:
-        pass
-    return 1450.0
+    """실시간 USD/KRW 환율 (1시간 캐시, 실패 시 1450 기본값)"""
+    from datetime import datetime as _dt
+    now = _dt.now()
+    if (_dash_usd_cache["updated"] is None or
+            (now - _dash_usd_cache["updated"]).total_seconds() > 3600):
+        try:
+            import yfinance as yf
+            rate = yf.Ticker("KRW=X").fast_info["last_price"]
+            if rate and 900 < rate < 2000:
+                _dash_usd_cache["rate"]    = float(rate)
+                _dash_usd_cache["updated"] = now
+        except Exception:
+            pass
+    return _dash_usd_cache["rate"]
 
 
 def get_current_prices(positions: list) -> dict:
@@ -620,8 +627,9 @@ def index():
 @app.route("/api/summary")
 @login_required
 def api_summary():
-    trades = get_trades()
-    s = get_summary(trades)
+    trades    = get_trades()
+    positions = enrich_positions(get_positions())
+    s = get_summary(trades, positions)
     return jsonify(s)
 
 

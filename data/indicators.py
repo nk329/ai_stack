@@ -77,7 +77,9 @@ class TechnicalIndicators:
         avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
         avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
 
-        rs = avg_gain / avg_loss
+        # avg_loss=0 (전구간 상승) 시 divide-by-zero 방지
+        avg_loss_safe = avg_loss.replace(0, 1e-10)
+        rs = avg_gain / avg_loss_safe
         df[f"rsi{period}"] = 100 - (100 / (1 + rs))
 
         # RSI 신호
@@ -127,8 +129,9 @@ class TechnicalIndicators:
         df["bb_upper"] = df["bb_mid"] + (std * std_dev)
         df["bb_lower"] = df["bb_mid"] - (std * std_dev)
 
-        # %B 지표 (밴드 내 위치)
-        df["bb_pct"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])
+        # %B 지표 (밴드 내 위치) - band_width=0 시 divide-by-zero 방지
+        band_width = (df["bb_upper"] - df["bb_lower"]).replace(0, 1e-10)
+        df["bb_pct"] = (df["close"] - df["bb_lower"]) / band_width
 
         # 밴드폭 (변동성 측정)
         df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]

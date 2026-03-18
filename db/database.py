@@ -74,9 +74,10 @@ class TradingDB:
     def record_trade(self, market: str, symbol: str, side: str,
                      price: float, quantity: float, fee: float = 0,
                      strategy: str = "", note: str = "") -> int:
-        """거래 기록 저장"""
+        """거래 기록 저장 + 매도 시 daily_stats 자동 업데이트"""
         amount = price * quantity
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        today  = datetime.now().strftime("%Y-%m-%d")
 
         with self._get_conn() as conn:
             cur = conn.execute(
@@ -87,6 +88,28 @@ class TradingDB:
             )
             trade_id = cur.lastrowid
             logger.info(f"거래 기록: [{side}] {symbol} {quantity} @ {price:,.2f} (ID: {trade_id})")
+
+            # 매도 시 note에서 pnl 파싱해 daily_stats 업데이트
+            if "SELL" in side.upper():
+                import re
+                pnl = 0.0
+                m = re.search(r"pnl:([+\-\d,.]+)", note or "")
+                if m:
+                    try:
+                        pnl = float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
+                is_win = 1 if pnl > 0 else 0
+                conn.execute(
+                    """INSERT INTO daily_stats (date, capital, daily_pnl, trade_count, win_count, lose_count)
+                       VALUES (?, 0, ?, 1, ?, ?)
+                       ON CONFLICT(date) DO UPDATE SET
+                         daily_pnl   = daily_pnl + excluded.daily_pnl,
+                         trade_count = trade_count + 1,
+                         win_count   = win_count + excluded.win_count,
+                         lose_count  = lose_count + excluded.lose_count""",
+                    (today, pnl, is_win, 1 - is_win)
+                )
             return trade_id
 
     def get_trades(self, symbol: str = None, limit: int = 50) -> list:
@@ -111,16 +134,33 @@ class TradingDB:
     def open_position(self, market: str, symbol: str, entry_price: float,
                       quantity: float, stop_loss: float = None,
                       take_profit: float = None, strategy: str = ""):
-        """포지션 오픈 (매수 후 기록)"""
+        """포지션 오픈 (매수 후 기록)
+        - 신규 포지션: INSERT
+        - 이미 존재하면 수량/손절/익절만 업데이트 (진입가·진입일 보존)
+        """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._get_conn() as conn:
-            conn.execute(
-                """INSERT OR REPLACE INTO positions
-                   (market, symbol, entry_price, quantity, entry_date, stop_loss, take_profit, strategy)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (market, symbol, entry_price, quantity, now, stop_loss, take_profit, strategy)
-            )
-            logger.info(f"포지션 오픈: {symbol} {quantity} @ {entry_price:,.2f}")
+            existing = conn.execute(
+                "SELECT id FROM positions WHERE market=? AND symbol=?",
+                (market, symbol)
+            ).fetchone()
+            if existing:
+                # 추가매수: 기존 진입가·진입일 유지, 수량/손절/익절만 갱신
+                conn.execute(
+                    """UPDATE positions
+                       SET quantity=quantity+?, stop_loss=?, take_profit=?
+                       WHERE market=? AND symbol=?""",
+                    (quantity, stop_loss, take_profit, market, symbol)
+                )
+                logger.info(f"포지션 추가: {symbol} +{quantity} (진입가·날짜 유지)")
+            else:
+                conn.execute(
+                    """INSERT INTO positions
+                       (market, symbol, entry_price, quantity, entry_date, stop_loss, take_profit, strategy)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (market, symbol, entry_price, quantity, now, stop_loss, take_profit, strategy)
+                )
+                logger.info(f"포지션 오픈: {symbol} {quantity} @ {entry_price:,.2f}")
 
     def close_position(self, market: str, symbol: str) -> dict:
         """포지션 클로즈 (매도 후 삭제)"""

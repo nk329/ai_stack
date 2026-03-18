@@ -162,8 +162,9 @@ class AIScreener:
         # ── 수익률 계산 ──
         change_1d  = float(ticker.get("signed_change_rate", 0))
         prices     = df["close"].values
-        change_7d  = (prices[-1] / prices[min(-7, -len(prices))] - 1) if len(prices) >= 7 else 0
-        change_30d = (prices[-1] / prices[min(-30, -len(prices))] - 1) if len(prices) >= 30 else 0
+        # max() 사용: -7과 -len 중 0에 가까운 값 = 올바른 N봉 전 인덱스
+        change_7d  = (prices[-1] / prices[max(-7, -len(prices))] - 1) if len(prices) >= 7 else 0
+        change_30d = (prices[-1] / prices[max(-30, -len(prices))] - 1) if len(prices) >= 30 else 0
 
         # ── 거래량 비율 ──
         vol_now = df["volume"].iloc[-1]
@@ -218,13 +219,14 @@ class AIScreener:
         elif vol_ratio >= 1.0: volume_score = 5
         else:                   volume_score = 0
 
-        # 4. 안정성 점수 (20점) - 변동성이 낮을수록 좋음
+        # 4. 안정성 점수 (20점) - 1시간봉 기준 변동성 임계값 적용
+        # 1시간봉 std는 일봉의 약 4~5배이므로 임계값을 상향 조정
         volatility = float(df["close"].pct_change().std())
-        if volatility < 0.02:   stability_score = 20
-        elif volatility < 0.03: stability_score = 15
-        elif volatility < 0.05: stability_score = 10
-        elif volatility < 0.08: stability_score = 5
-        else:                    stability_score = 0  # 너무 변동성 큼
+        if volatility < 0.008:  stability_score = 20
+        elif volatility < 0.015: stability_score = 15
+        elif volatility < 0.025: stability_score = 10
+        elif volatility < 0.040: stability_score = 5
+        else:                    stability_score = 0
 
         total_score = (
             momentum_score +
@@ -360,8 +362,9 @@ class AIScreener:
         prices   = df["close"].values
 
         change_1d  = float(df["close"].pct_change().iloc[-1])
-        change_7d  = (prices[-1] / prices[min(-7, -len(prices))] - 1) if len(prices) >= 7 else 0
-        change_30d = (prices[-1] / prices[min(-30, -len(prices))] - 1) if len(prices) >= 30 else 0
+        # max() 사용: -7과 -len 중 0에 가까운 값 = 올바른 N봉 전 인덱스
+        change_7d  = (prices[-1] / prices[max(-7, -len(prices))] - 1) if len(prices) >= 7 else 0
+        change_30d = (prices[-1] / prices[max(-30, -len(prices))] - 1) if len(prices) >= 30 else 0
 
         vol_now   = float(df["volume"].iloc[-1])
         vol_avg   = float(df["volume"].iloc[-20:].mean())

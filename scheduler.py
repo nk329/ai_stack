@@ -10,7 +10,7 @@ import time
 import json
 import logging
 import schedule
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import pytz
 import yfinance as yf
@@ -43,7 +43,7 @@ def get_usd_krw() -> float:
     now = datetime.now()
     cached = _usd_krw_cache
     # 캐시가 없거나 1시간 이상 지났으면 갱신
-    if cached["updated"] is None or (now - cached["updated"]).seconds > 3600:
+    if cached["updated"] is None or (now - cached["updated"]).total_seconds() > 3600:
         try:
             ticker = yf.Ticker("KRW=X")
             rate = ticker.fast_info["last_price"]
@@ -470,7 +470,7 @@ class AutoTrader:
                 # 보유일 계산
                 days_held = 0
                 try:
-                    from datetime import timedelta as td
+
                     entry_date = datetime.strptime(
                         p.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=KST)
@@ -507,7 +507,7 @@ class AutoTrader:
                         self.risk.record_trade_result(pnl)
                         self._save_virtual_krw()
                         self._max_price.pop(market, None)
-                        from datetime import timedelta
+
                         self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     else:
                         coin = market.split("-")[1]
@@ -613,7 +613,7 @@ class AutoTrader:
             # 시간 기반 탈출: 보유일 계산
             days_held = 0
             try:
-                from datetime import timedelta as td
+
                 entry_date = datetime.strptime(
                     position.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
                 ).replace(tzinfo=KST)
@@ -652,7 +652,7 @@ class AutoTrader:
                     self.risk.record_trade_result(pnl)
                     self._save_virtual_krw()
                     self._max_price.pop(market, None)  # 최고가 초기화
-                    from datetime import timedelta
+
                     self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     logger.info(f"  [{market}] 쿨다운 시작 ({self._cooldown_minutes}분)")
                 else:
@@ -666,7 +666,7 @@ class AutoTrader:
                                               strategy=strategy.name, note=sell_reason)
                         self.risk.record_trade_result(pnl)
                         logger.info(f"  [SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
-                        from datetime import timedelta
+
                         self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                         self._max_price.pop(market, None)
             else:
@@ -836,7 +836,7 @@ class AutoTrader:
                                          note=f"AI:{cfg['score']:.0f}pt {name} rate:{usd_krw:.0f} krw:{total_krw:,.0f}")
                     self._save_virtual_krw()
                     # 쿨다운 등록 (매수 후에도 재매수 방지)
-                    from datetime import timedelta
+
                     self._cooldown[symbol] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                 except Exception as e:
                     logger.error(f"  [{symbol}] DB 저장 오류: {e}")
@@ -881,7 +881,7 @@ class AutoTrader:
                                          note=f"{sell_reason} rate:{usd_krw:.0f} fee:{sell_fee_usd:.2f} pnl:{pnl_krw:+,.0f}")
                     self.risk.record_trade_result(pnl_krw)
                     self._save_virtual_krw()
-                    from datetime import timedelta
+
                     self._cooldown[symbol] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
             else:
                 logger.info(
