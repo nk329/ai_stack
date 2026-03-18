@@ -445,6 +445,9 @@ class AutoTrader:
         if not crypto_pos:
             return
 
+        now = datetime.now(KST).strftime("%H:%M:%S")
+        logger.info(f"[{now}] ── 포지션 모니터 ({len(crypto_pos)}개) ──")
+
         for p in crypto_pos:
             market = p["symbol"]
             try:
