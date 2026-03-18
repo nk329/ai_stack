@@ -138,8 +138,8 @@ class AIScreener:
         """개별 코인 점수 계산"""
         market = ticker["market"]
 
-        # OHLCV 데이터 조회
-        df = self.collector.get_crypto_ohlcv(market, count=60)
+        # 1시간봉 200개 = 약 8일치 (더 빠른 패턴 포착)
+        df = self.collector.get_crypto_ohlcv(market, interval="minute60", count=200)
         if df is None or len(df) < 20:
             return None
 

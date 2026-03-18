@@ -436,6 +436,94 @@ class AutoTrader:
         # if is_us_market_open(): ...
 
     # ─────────────────────────────────────────
+    # 포지션 전용 빠른 모니터 (30초마다)
+    # ─────────────────────────────────────────
+    def run_position_monitor(self):
+        """30초마다 실행 - OHLCV 없이 현재가만 조회해 손절/익절/트레일링/시간탈출 체크"""
+        open_positions = self.db.get_positions()
+        crypto_pos     = [p for p in open_positions if p.get("market") == "CRYPTO"]
+        if not crypto_pos:
+            return
+
+        for p in crypto_pos:
+            market = p["symbol"]
+            try:
+                current_price = self.upbit.get_current_price(market)
+                if not current_price:
+                    continue
+
+                entry  = float(p["entry_price"])
+                qty    = float(p["quantity"])
+                sl     = 0.05
+                tp     = 0.08
+                stop_p = float(p.get("stop_loss") or entry * (1 - sl))
+                take_p = float(p.get("take_profit") or entry * (1 + tp))
+                ret    = (current_price - entry) / entry
+
+                # 트레일링 스탑 갱신
+                prev_max = self._max_price.get(market, entry)
+                if current_price > prev_max:
+                    self._max_price[market] = current_price
+                    prev_max = current_price
+                trailing_stop = prev_max * (1 - self._trailing_pct)
+
+                # 보유일 계산
+                days_held = 0
+                try:
+                    from datetime import timedelta as td
+                    entry_date = datetime.strptime(
+                        p.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=KST)
+                    days_held = (datetime.now(KST) - entry_date).days
+                except Exception:
+                    pass
+
+                sell_reason = ""
+                if current_price <= trailing_stop and ret > -sl:
+                    sell_reason = f"트레일링스탑 ({ret:+.2%})"
+                elif current_price <= stop_p:
+                    sell_reason = f"고정손절 ({ret:+.2%})"
+                elif current_price >= take_p:
+                    sell_reason = f"익절 ({ret:+.2%})"
+                elif days_held >= self._time_exit_days and ret < 0:
+                    sell_reason = f"시간탈출 ({days_held}일, {ret:+.2%})"
+
+                if sell_reason:
+                    gross_pnl = (current_price - entry) * qty
+                    sell_fee  = current_price * qty * FEE_CRYPTO_SELL
+                    pnl       = gross_pnl - sell_fee
+                    if self.dry_run:
+                        self.virtual_krw += entry * qty + gross_pnl - sell_fee
+                        logger.info(
+                            f"  [FAST-SELL] {market} | "
+                            f"가격:{current_price:>14,.4f} | "
+                            f"손익:{pnl:>+10,.0f}원 | {sell_reason} "
+                            f"(가상잔고:{self.virtual_krw:,.0f}원)"
+                        )
+                        self.db.close_position("CRYPTO", market)
+                        self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
+                                             strategy="PositionMonitor",
+                                             note=f"{sell_reason} pnl:{pnl:+,.0f}")
+                        self.risk.record_trade_result(pnl)
+                        self._save_virtual_krw()
+                        self._max_price.pop(market, None)
+                        from datetime import timedelta
+                        self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
+                    else:
+                        coin = market.split("-")[1]
+                        bal  = self.upbit.get_coin_balance(coin)
+                        if bal > 0:
+                            self.upbit.sell_market_order(market, bal)
+                            self.db.close_position("CRYPTO", market)
+                            self.db.record_trade("CRYPTO", market, "SELL", current_price, bal,
+                                                 strategy="PositionMonitor", note=sell_reason)
+                            self.risk.record_trade_result(pnl)
+                            self._max_price.pop(market, None)
+                            logger.info(f"  [FAST-SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
+            except Exception as e:
+                logger.error(f"[포지션모니터] {market} 오류: {e}")
+
+    # ─────────────────────────────────────────
     # 개별 종목 매매 처리
     # ─────────────────────────────────────────
     def _process_crypto(self, cfg: dict):
@@ -443,7 +531,8 @@ class AutoTrader:
         strategy = cfg["strategy"]
         sl, tp   = cfg["stop_loss"], cfg["take_profit"]
 
-        df = self.collector.get_crypto_ohlcv(market, interval="day", count=100)
+        # 1시간봉 200개 = 약 8일치 데이터 (일봉 대비 더 빠른 신호 포착)
+        df = self.collector.get_crypto_ohlcv(market, interval="minute60", count=200)
         if df is None or df.empty or len(df) < 30:
             return
 
@@ -819,6 +908,9 @@ class AutoTrader:
         # ── 핵심: 3분마다 실시간 신호 체크 ──
         schedule.every(self.signal_interval).minutes.do(self.run_realtime_signals)
 
+        # ── 포지션 모니터: 30초마다 (손절/익절/트레일링 빠른 반응) ──
+        schedule.every(30).seconds.do(self.run_position_monitor)
+
         # ── 전체 스캔: 1시간마다 ──
         schedule.every(60).minutes.do(self.run_market_scan)
 
@@ -827,7 +919,8 @@ class AutoTrader:
 
         mode = "Dry Run" if self.dry_run else "실전 매매"
         logger.info(f"스케줄 등록 완료 [{mode}]")
-        logger.info(f"  실시간 신호 체크 : 매 {self.signal_interval}분")
+        logger.info(f"  포지션 모니터    : 매 30초 (손절/익절/트레일링)")
+        logger.info(f"  실시간 신호 체크 : 매 {self.signal_interval}분 (1시간봉 패턴)")
         logger.info(f"  전체 시장 스캔   : 매 60분")
         logger.info(f"  일일 리포트      : 08:00")
         logger.info(f"  Ctrl+C 로 중단")
