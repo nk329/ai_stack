@@ -150,9 +150,11 @@ class AutoTrader:
         # 시간 기반 탈출: 보유 X일 이상 & 수익 없으면 매도
         self._time_exit_days = 5      # 5일 이상 보유 & 수익률 0% 미만 → 매도
 
-        # ── 분할 매도 설정 ──
-        self._partial_sold: set    = set()    # 이미 50% 분할매도 완료한 마켓 추적
-        self._partial_exit_pct: float = 0.05  # +5% 도달 시 보유 수량의 50% 매도
+        # ── 분할 매도 3단계 설정 ──
+        self._partial_stage: dict  = {}       # {market: 0/1/2} 단계 추적
+        self._partial_exit_1_pct: float = 0.03  # +3%: 보유수량 30% 매도 (1단계)
+        self._partial_exit_2_pct: float = 0.05  # +5%: 남은수량 50% 매도 (2단계)
+        # 나머지는 트레일링 스탑으로 관리 (3단계)
 
         # ── 추가 매수 (DCA) 설정 ──
         self._dca_count: dict  = {}    # {market: 추가매수 횟수}
@@ -162,6 +164,13 @@ class AutoTrader:
 
         # 마지막 강제 스캔 시각 (가용 현금 재배치용)
         self._last_scan_time = None
+
+        # ── 10초 모멘텀 스캐너 ──
+        from collections import deque
+        self._price_history: dict     = {}   # {market: deque([(ts, price)])} 5분 롤링
+        self._momentum_candidates: dict = {} # {market: {momentum, price, ts}} 핫 후보
+        self._hot_markets_cache: list   = [] # 전체 KRW 마켓 목록 캐시
+        self._hot_markets_updated       = None
 
         # Dry Run 가상 잔고 (재시작 후에도 유지 - JSON 파일로 영속 저장)
         self._vkrw_file = Path("db/virtual_state.json")
@@ -205,13 +214,19 @@ class AutoTrader:
             logger.warning(f"[가상잔고] 파일 저장 실패: {e}")
 
     # ─────────────────────────────────────────
-    # 분할 매도 실행 (50%)
+    # 분할 매도 실행 (3단계)
     # ─────────────────────────────────────────
-    def _do_partial_sell(self, market: str, current_price: float, position: dict, reason: str):
-        """보유 수량의 50%를 즉시 매도하고 나머지는 트레일링 스탑으로 관리"""
+    def _do_partial_sell(self, market: str, current_price: float, position: dict,
+                         reason: str, sell_ratio: float, stage: int):
+        """분할 매도 실행
+        stage 1 (+3%): 보유수량의 30% 매도
+        stage 2 (+5%): 남은수량의 50% 매도 (전체 기준 ~65% 정리)
+        """
         qty      = float(position["quantity"])
         entry    = float(position["entry_price"])
-        sell_qty = qty * 0.5
+        sell_qty = qty * sell_ratio
+        if sell_qty <= 0:
+            return
         gross    = (current_price - entry) * sell_qty
         fee      = current_price * sell_qty * FEE_CRYPTO_SELL
         pnl      = gross - fee
@@ -219,14 +234,14 @@ class AutoTrader:
         if self.dry_run:
             self.virtual_krw += entry * sell_qty + gross - fee
             logger.info(
-                f"  [PARTIAL-SELL 50%] {market} | "
-                f"가격:{current_price:>14,.4f} | 매도수량:{sell_qty:.8f} | "
+                f"  [PARTIAL-SELL 단계{stage}] {market} | "
+                f"가격:{current_price:>14,.4f} | 매도비율:{sell_ratio:.0%} | "
                 f"손익:{pnl:>+10,.0f}원 | {reason} "
                 f"(가상잔고:{self.virtual_krw:,.0f}원)"
             )
             self.db.partial_close_position("CRYPTO", market, sell_qty)
             self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, sell_qty,
-                                 fee=fee, strategy="PartialExit",
+                                 fee=fee, strategy=f"PartialExit-S{stage}",
                                  note=f"{reason} pnl:{pnl:+,.0f}")
             self.risk.record_trade_result(pnl)
             self._save_virtual_krw()
@@ -235,11 +250,11 @@ class AutoTrader:
             if result:
                 self.db.partial_close_position("CRYPTO", market, sell_qty)
                 self.db.record_trade("CRYPTO", market, "SELL", current_price, sell_qty,
-                                     fee=fee, strategy="PartialExit", note=reason)
+                                     fee=fee, strategy=f"PartialExit-S{stage}", note=reason)
                 self.risk.record_trade_result(pnl)
-                logger.info(f"  [PARTIAL-SELL 50%] {market} {reason} | 손익:{pnl:+,.0f}원")
+                logger.info(f"  [PARTIAL-SELL 단계{stage}] {market} {reason} | 손익:{pnl:+,.0f}원")
 
-        self._partial_sold.add(market)   # 분할매도 완료 표시
+        self._partial_stage[market] = stage  # 단계 기록
 
     # ─────────────────────────────────────────
     # 추가 매수 (DCA) 실행
@@ -312,6 +327,132 @@ class AutoTrader:
 
         self._last_scan_time = datetime.now(KST)
         logger.info(f"[{now}] ════ 스캔 완료 ════")
+
+    # ─────────────────────────────────────────
+    # 10초 모멘텀 스캐너 - 전체 코인 급등/급락 감지
+    # ─────────────────────────────────────────
+    def run_momentum_scan(self):
+        """10초마다: 전체 KRW 코인 현재가 조회 → 5분 전 대비 ±1.5% 이상 움직인 코인 플래그"""
+        try:
+            import pyupbit
+            from collections import deque
+
+            now = datetime.now(KST)
+
+            # 마켓 목록 1시간마다 갱신
+            if (self._hot_markets_updated is None or
+                    (now - self._hot_markets_updated).total_seconds() > 3600):
+                markets = pyupbit.get_tickers(fiat="KRW")
+                if markets:
+                    self._hot_markets_cache    = markets
+                    self._hot_markets_updated  = now
+
+            if not self._hot_markets_cache:
+                return
+
+            # 전체 현재가 단 1번 API 콜로 조회
+            prices = pyupbit.get_current_price(self._hot_markets_cache)
+            if not prices or not isinstance(prices, dict):
+                return
+
+            new_candidates = 0
+            for market, price in prices.items():
+                if not price or float(price) <= 0:
+                    continue
+                price = float(price)
+
+                # 가격 히스토리 업데이트 (30개 × 10초 = 5분 롤링)
+                if market not in self._price_history:
+                    self._price_history[market] = deque(maxlen=30)
+                self._price_history[market].append((now, price))
+
+                history = self._price_history[market]
+                if len(history) < 6:   # 최소 1분 데이터 필요
+                    continue
+
+                # 가장 오래된 가격과 모멘텀 계산
+                old_ts, old_price = history[0]
+                age_sec = (now - old_ts).total_seconds()
+                if age_sec < 30 or old_price <= 0:
+                    continue
+
+                momentum = (price - old_price) / old_price
+
+                # ±1.5% 이상 → 핫 후보 등록 (포지션 없고 쿨다운 아닌 경우만)
+                if abs(momentum) >= 0.015:
+                    existing = self.db.get_position("CRYPTO", market)
+                    cooldown_until = self._cooldown.get(market)
+                    is_cooled = cooldown_until and datetime.now(KST) < cooldown_until
+                    if not existing and not is_cooled:
+                        self._momentum_candidates[market] = {
+                            "momentum": momentum,
+                            "price":    price,
+                            "ts":       now,
+                        }
+                        new_candidates += 1
+
+            if new_candidates > 0:
+                logger.debug(f"[모멘텀] 새 후보 {new_candidates}개 추가 (총 {len(self._momentum_candidates)}개)")
+
+        except Exception as e:
+            logger.debug(f"[모멘텀스캔] 오류: {e}")
+
+    # ─────────────────────────────────────────
+    # 1분 핫 종목 집중 분석
+    # ─────────────────────────────────────────
+    def run_hot_signals(self):
+        """1분마다: 모멘텀 감지된 상위 10개 코인을 OHLCV + 패턴 분석 후 즉시 매수"""
+        if not self._momentum_candidates:
+            return
+
+        now = datetime.now(KST)
+
+        # 3분 이상 된 후보 제거 (시장 변화 반영)
+        fresh = {
+            m: v for m, v in self._momentum_candidates.items()
+            if (now - v["ts"]).total_seconds() < 180
+        }
+        self._momentum_candidates = fresh
+
+        if not fresh:
+            return
+
+        # 모멘텀 절대값 기준 상위 10개 선택 (양/음 모두 - 반등 포함)
+        # 단, 급락(-) 보다 급등(+) 모멘텀 우선
+        top10 = sorted(
+            fresh.items(),
+            key=lambda x: x[1]["momentum"],  # 상승 모멘텀 우선
+            reverse=True
+        )[:10]
+
+        logger.info(f"[핫스캔] 모멘텀 후보 {len(fresh)}개 중 상위 {len(top10)}개 패턴 분석")
+
+        # 완화된 매수 기준 (45점)
+        pattern_strat = PatternStrategy(buy_score_threshold=45.0)
+
+        for market, info in top10:
+            if self.db.get_position("CRYPTO", market):
+                continue
+            cfg = {
+                "market":    market,
+                "name":      market,
+                "strategy":  pattern_strat,
+                "stop_loss":   0.05,
+                "take_profit": 0.08,
+                "score":     abs(info["momentum"]) * 100,  # 모멘텀 크기를 점수로 활용
+                "capital":   0,
+            }
+            try:
+                self._process_crypto(cfg)
+            except Exception as e:
+                logger.error(f"[핫스캔] {market} 오류: {e}")
+
+        # 처리 완료된 후보 제거
+        processed = {m for m, _ in top10}
+        self._momentum_candidates = {
+            m: v for m, v in self._momentum_candidates.items()
+            if m not in processed
+        }
 
     def _scan_crypto(self):
         logger.info("  [코인] 전체 KRW 코인 스캔...")
@@ -471,9 +612,9 @@ class AutoTrader:
 
     def _build_crypto_targets(self, actions, allocation, scores) -> list:
         # 차트 패턴 전략 (이미지 분석 기반)
-        # 매수: 쌍바닥+핀버+MA추세+거래량+피보나치 점수제 (55점 이상)
+        # 매수: 쌍바닥+핀버+MA추세+거래량+피보나치 점수제 (45점 이상으로 완화)
         # 매도: 쌍봉+흑삼병+급락캔들+MA하향 즉시 매도
-        pattern_strat = PatternStrategy(buy_score_threshold=55.0)
+        pattern_strat = PatternStrategy(buy_score_threshold=45.0)
 
         return [
             {
@@ -599,13 +740,22 @@ class AutoTrader:
                 except Exception:
                     pass
 
-                # ── 분할 익절: +5% 도달 (30초 모니터에서 빠른 체크) ──
-                if ret >= self._partial_exit_pct and market not in self._partial_sold:
+                # ── 분할 익절 3단계 (30초 모니터에서도 체크) ──
+                mon_stage = self._partial_stage.get(market, 0)
+                if mon_stage < 1 and ret >= self._partial_exit_1_pct:
                     self._do_partial_sell(
                         market, current_price, p,
-                        f"+{self._partial_exit_pct:.0%} 분할익절(모니터)"
+                        f"+{self._partial_exit_1_pct:.0%} 1단계분할익절(모니터)",
+                        sell_ratio=0.30, stage=1
                     )
-                    continue  # 나머지 수량은 이후 루프에서 트레일링으로 관리
+                    continue
+                if mon_stage < 2 and ret >= self._partial_exit_2_pct:
+                    self._do_partial_sell(
+                        market, current_price, p,
+                        f"+{self._partial_exit_2_pct:.0%} 2단계분할익절(모니터)",
+                        sell_ratio=0.50, stage=2
+                    )
+                    continue
 
                 sell_reason = ""
                 if current_price <= trailing_stop and ret > -sl:
@@ -636,7 +786,7 @@ class AutoTrader:
                         self.risk.record_trade_result(pnl)
                         self._save_virtual_krw()
                         self._max_price.pop(market, None)
-                        self._partial_sold.discard(market)
+                        self._partial_stage.pop(market, None)
                         self._dca_count.pop(market, None)
                         self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     else:
@@ -650,7 +800,7 @@ class AutoTrader:
                                                  note=sell_reason)
                             self.risk.record_trade_result(pnl)
                             self._max_price.pop(market, None)
-                            self._partial_sold.discard(market)
+                            self._partial_stage.pop(market, None)
                             self._dca_count.pop(market, None)
                             logger.info(f"  [FAST-SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
             except Exception as e:
@@ -688,11 +838,21 @@ class AutoTrader:
             krw = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
 
             # 동적 포지션 사이징: 가용 현금을 남은 슬롯 수로 균등 배분
-            open_count     = len(self.db.get_positions())
+            open_count      = len(self.db.get_positions())
             remaining_slots = max(self.max_crypto - open_count, 1)
-            dynamic_invest  = krw * 0.95 / remaining_slots          # 남은 슬롯에 균등 배분
-            invest          = max(dynamic_invest, self.per_position_krw)  # 최소 per_position_krw 보장
-            invest          = min(invest, krw * 0.95)                # 가용 잔고 초과 방지
+            dynamic_invest  = krw * 0.95 / remaining_slots
+
+            # 확신도 비례 투자: 점수 높을수록 더 많이 투자
+            score = cfg.get("score", 0)
+            if score >= 70:
+                conviction = 1.3   # 강한 신호 → 30% 추가 투자
+            elif score >= 55:
+                conviction = 1.0   # 표준
+            else:
+                conviction = 0.8   # 약한 신호 → 20% 절감
+
+            invest = max(dynamic_invest * conviction, self.per_position_krw)
+            invest = min(invest, krw * 0.95)
 
             if invest < 5000:
                 logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원, 필요:5,000원)")
@@ -780,13 +940,22 @@ class AutoTrader:
                 )
             return  # BUY 신호이므로 매도 조건 검토 안 함
 
-        # ── 분할 익절: +5% 도달 시 50% 매도 (최초 1회) ──
-        if ret >= self._partial_exit_pct and market not in self._partial_sold:
+        # ── 분할 익절 3단계 ──
+        stage = self._partial_stage.get(market, 0)
+        if stage < 1 and ret >= self._partial_exit_1_pct:
+            # 1단계: +3% → 보유수량 30% 매도
             self._do_partial_sell(
                 market, current_price, position,
-                f"+{self._partial_exit_pct:.0%} 분할익절 (나머지 트레일링)"
+                f"+{self._partial_exit_1_pct:.0%} 1단계분할익절", sell_ratio=0.30, stage=1
             )
-            return  # 나머지는 트레일링 스탑으로 관리
+            return
+        if stage < 2 and ret >= self._partial_exit_2_pct:
+            # 2단계: +5% → 남은수량 50% 매도 (전체 기준 ~65% 정리)
+            self._do_partial_sell(
+                market, current_price, position,
+                f"+{self._partial_exit_2_pct:.0%} 2단계분할익절", sell_ratio=0.50, stage=2
+            )
+            return  # 나머지 ~35%는 트레일링 스탑으로 관리
 
         # ── 전량 매도 조건 ──
         sell_reason = ""
@@ -820,7 +989,7 @@ class AutoTrader:
                 self.risk.record_trade_result(pnl)
                 self._save_virtual_krw()
                 self._max_price.pop(market, None)
-                self._partial_sold.discard(market)   # 분할매도 플래그 초기화
+                self._partial_stage.pop(market, None)  # 분할매도 단계 초기화
                 self._dca_count.pop(market, None)    # DCA 횟수 초기화
                 self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                 logger.info(f"  [{market}] 쿨다운 시작 ({self._cooldown_minutes}분)")
@@ -835,7 +1004,7 @@ class AutoTrader:
                                           fee=sell_fee, strategy=strategy.name, note=sell_reason)
                     self.risk.record_trade_result(pnl)
                     self._max_price.pop(market, None)
-                    self._partial_sold.discard(market)
+                    self._partial_stage.pop(market, None)
                     self._dca_count.pop(market, None)
                     self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     logger.info(f"  [SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
@@ -1078,8 +1247,17 @@ class AutoTrader:
         # ── 핵심: 3분마다 실시간 신호 체크 ──
         schedule.every(self.signal_interval).minutes.do(self.run_realtime_signals)
 
+        # ── 10초: 전체 코인 모멘텀 감지 (급등/급락 탐지) ──
+        schedule.every(10).seconds.do(self.run_momentum_scan)
+
+        # ── 1분: 모멘텀 감지 종목 패턴 분석 + 즉시 매수 ──
+        schedule.every(1).minutes.do(self.run_hot_signals)
+
         # ── 포지션 모니터: 30초마다 (손절/익절/트레일링 빠른 반응) ──
         schedule.every(30).seconds.do(self.run_position_monitor)
+
+        # ── 3분: 기존 포지션 + 타겟 신호 체크 ──
+        schedule.every(self.signal_interval).minutes.do(self.run_realtime_signals)
 
         # ── 전체 스캔: 1시간마다 ──
         schedule.every(60).minutes.do(self.run_market_scan)
@@ -1089,8 +1267,10 @@ class AutoTrader:
 
         mode = "Dry Run" if self.dry_run else "실전 매매"
         logger.info(f"스케줄 등록 완료 [{mode}]")
+        logger.info(f"  모멘텀 스캔      : 매 10초 (전체 200개 코인 급등/급락 감지)")
+        logger.info(f"  핫 종목 분석     : 매 1분  (모멘텀 상위 10개 패턴 분석 + 매수)")
         logger.info(f"  포지션 모니터    : 매 30초 (손절/익절/트레일링)")
-        logger.info(f"  실시간 신호 체크 : 매 {self.signal_interval}분 (1시간봉 패턴)")
+        logger.info(f"  실시간 신호 체크 : 매 {self.signal_interval}분 (보유 포지션 관리)")
         logger.info(f"  전체 시장 스캔   : 매 60분")
         logger.info(f"  일일 리포트      : 08:00")
         logger.info(f"  Ctrl+C 로 중단")
@@ -1104,7 +1284,7 @@ class AutoTrader:
         while True:
             try:
                 schedule.run_pending()
-                time.sleep(10)
+                time.sleep(1)   # 1초 단위로 스케줄 체크 (10초 모멘텀 스캔 정확도 향상)
             except KeyboardInterrupt:
                 logger.info("사용자 중단 (Ctrl+C)")
                 break
