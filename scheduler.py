@@ -246,8 +246,12 @@ class AutoTrader:
     # ─────────────────────────────────────────
     def _do_dca_buy(self, market: str, current_price: float, position: dict, cfg: dict):
         """BUY 신호 재발생 + 진입가 대비 -2~-7% 구간에서 추가 매수 (평단 낮추기)"""
-        avail_krw = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
-        invest    = min(self.per_position_krw, avail_krw * 0.95)
+        avail_krw       = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
+        open_count      = len(self.db.get_positions())
+        remaining_slots = max(self.max_crypto - open_count, 1)
+        dynamic_invest  = avail_krw * 0.95 / remaining_slots
+        invest          = max(dynamic_invest, self.per_position_krw)
+        invest          = min(invest, avail_krw * 0.95)
         if invest < 5000:
             logger.info(f"  [{market}] DCA 잔고 부족 (가용:{avail_krw:,.0f}원)")
             return
@@ -681,8 +685,15 @@ class AutoTrader:
                 logger.info(f"  [{market}] 쿨다운 중 ({remain}분 후 재매수 가능)")
                 return
 
-            krw    = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
-            invest = min(self.per_position_krw, krw * 0.95)
+            krw = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
+
+            # 동적 포지션 사이징: 가용 현금을 남은 슬롯 수로 균등 배분
+            open_count     = len(self.db.get_positions())
+            remaining_slots = max(self.max_crypto - open_count, 1)
+            dynamic_invest  = krw * 0.95 / remaining_slots          # 남은 슬롯에 균등 배분
+            invest          = max(dynamic_invest, self.per_position_krw)  # 최소 per_position_krw 보장
+            invest          = min(invest, krw * 0.95)                # 가용 잔고 초과 방지
+
             if invest < 5000:
                 logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원, 필요:5,000원)")
                 return
@@ -697,6 +708,7 @@ class AutoTrader:
                 logger.info(
                     f"  [DRY-BUY]  {market} | "
                     f"가격:{current_price:>14,.4f} | 금액:{invest:>8,.0f}원 | "
+                    f"[잔고{krw:,.0f}÷슬롯{remaining_slots}개] | "
                     f"수수료:{fee:,.0f}원 | "
                     f"손절:{stop_price:>14,.4f} | 익절:{take_price:>14,.4f} | "
                     f"패턴점수:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
