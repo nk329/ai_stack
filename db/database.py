@@ -163,7 +163,7 @@ class TradingDB:
                 logger.info(f"포지션 오픈: {symbol} {quantity} @ {entry_price:,.2f}")
 
     def close_position(self, market: str, symbol: str) -> dict:
-        """포지션 클로즈 (매도 후 삭제)"""
+        """포지션 클로즈 (전량 매도 후 삭제)"""
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             pos = conn.execute(
@@ -178,6 +178,34 @@ class TradingDB:
                 logger.info(f"포지션 클로즈: {symbol}")
                 return dict(pos)
             return {}
+
+    def partial_close_position(self, market: str, symbol: str, sell_qty: float) -> dict:
+        """포지션 부분 클로즈 (분할 매도) - 수량 차감 후 잔량 유지
+        잔량이 0 이하면 전량 삭제. 분할 매도 전 포지션 정보를 반환."""
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            pos = conn.execute(
+                "SELECT * FROM positions WHERE market=? AND symbol=?",
+                (market, symbol)
+            ).fetchone()
+            if not pos:
+                return {}
+            pos_dict  = dict(pos)
+            remaining = float(pos_dict["quantity"]) - sell_qty
+            if remaining <= 1e-10:
+                # 잔량이 사실상 0 → 전량 삭제
+                conn.execute(
+                    "DELETE FROM positions WHERE market=? AND symbol=?",
+                    (market, symbol)
+                )
+                logger.info(f"포지션 전량 클로즈 (분할매도 후 잔량 없음): {symbol}")
+            else:
+                conn.execute(
+                    "UPDATE positions SET quantity=? WHERE market=? AND symbol=?",
+                    (remaining, market, symbol)
+                )
+                logger.info(f"포지션 부분 매도: {symbol} {sell_qty:.8f} 매도 → 잔량 {remaining:.8f}")
+            return pos_dict
 
     def get_positions(self) -> list:
         """현재 보유 포지션 전체 조회"""

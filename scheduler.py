@@ -150,6 +150,19 @@ class AutoTrader:
         # 시간 기반 탈출: 보유 X일 이상 & 수익 없으면 매도
         self._time_exit_days = 5      # 5일 이상 보유 & 수익률 0% 미만 → 매도
 
+        # ── 분할 매도 설정 ──
+        self._partial_sold: set    = set()    # 이미 50% 분할매도 완료한 마켓 추적
+        self._partial_exit_pct: float = 0.05  # +5% 도달 시 보유 수량의 50% 매도
+
+        # ── 추가 매수 (DCA) 설정 ──
+        self._dca_count: dict  = {}    # {market: 추가매수 횟수}
+        self._dca_max:   int   = 1     # 포지션당 최대 1회 추가 매수
+        self._dca_drop_min: float = 0.02   # 진입가 대비 -2% 이상 하락 시 DCA 검토
+        self._dca_drop_max: float = 0.07   # 진입가 대비 -7% 초과 하락 시 DCA 중단 (추세 하락)
+
+        # 마지막 강제 스캔 시각 (가용 현금 재배치용)
+        self._last_scan_time = None
+
         # Dry Run 가상 잔고 (재시작 후에도 유지 - JSON 파일로 영속 저장)
         self._vkrw_file = Path("db/virtual_state.json")
         self.virtual_krw: float = self._load_virtual_krw()
@@ -192,6 +205,90 @@ class AutoTrader:
             logger.warning(f"[가상잔고] 파일 저장 실패: {e}")
 
     # ─────────────────────────────────────────
+    # 분할 매도 실행 (50%)
+    # ─────────────────────────────────────────
+    def _do_partial_sell(self, market: str, current_price: float, position: dict, reason: str):
+        """보유 수량의 50%를 즉시 매도하고 나머지는 트레일링 스탑으로 관리"""
+        qty      = float(position["quantity"])
+        entry    = float(position["entry_price"])
+        sell_qty = qty * 0.5
+        gross    = (current_price - entry) * sell_qty
+        fee      = current_price * sell_qty * FEE_CRYPTO_SELL
+        pnl      = gross - fee
+
+        if self.dry_run:
+            self.virtual_krw += entry * sell_qty + gross - fee
+            logger.info(
+                f"  [PARTIAL-SELL 50%] {market} | "
+                f"가격:{current_price:>14,.4f} | 매도수량:{sell_qty:.8f} | "
+                f"손익:{pnl:>+10,.0f}원 | {reason} "
+                f"(가상잔고:{self.virtual_krw:,.0f}원)"
+            )
+            self.db.partial_close_position("CRYPTO", market, sell_qty)
+            self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, sell_qty,
+                                 fee=fee, strategy="PartialExit",
+                                 note=f"{reason} pnl:{pnl:+,.0f}")
+            self.risk.record_trade_result(pnl)
+            self._save_virtual_krw()
+        else:
+            result = self.upbit.sell_market_order(market, sell_qty)
+            if result:
+                self.db.partial_close_position("CRYPTO", market, sell_qty)
+                self.db.record_trade("CRYPTO", market, "SELL", current_price, sell_qty,
+                                     fee=fee, strategy="PartialExit", note=reason)
+                self.risk.record_trade_result(pnl)
+                logger.info(f"  [PARTIAL-SELL 50%] {market} {reason} | 손익:{pnl:+,.0f}원")
+
+        self._partial_sold.add(market)   # 분할매도 완료 표시
+
+    # ─────────────────────────────────────────
+    # 추가 매수 (DCA) 실행
+    # ─────────────────────────────────────────
+    def _do_dca_buy(self, market: str, current_price: float, position: dict, cfg: dict):
+        """BUY 신호 재발생 + 진입가 대비 -2~-7% 구간에서 추가 매수 (평단 낮추기)"""
+        avail_krw = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
+        invest    = min(self.per_position_krw, avail_krw * 0.95)
+        if invest < 5000:
+            logger.info(f"  [{market}] DCA 잔고 부족 (가용:{avail_krw:,.0f}원)")
+            return
+
+        sl         = cfg.get("stop_loss", 0.05)
+        tp         = cfg.get("take_profit", 0.08)
+        stop_price = current_price * (1 - sl)
+        take_price = current_price * (1 + tp)
+        dca_n      = self._dca_count.get(market, 0) + 1
+        entry      = float(position["entry_price"])
+
+        if self.dry_run:
+            fee              = invest * FEE_CRYPTO_BUY
+            self.virtual_krw -= invest + fee
+            qty              = invest / current_price
+            self._dca_count[market] = dca_n
+            logger.info(
+                f"  [DCA-BUY #{dca_n}]  {market} | "
+                f"가격:{current_price:>14,.4f} | 금액:{invest:>8,.0f}원 | "
+                f"기존진입가:{entry:>14,.4f} | 수수료:{fee:,.0f}원 | "
+                f"(가상잔고:{self.virtual_krw:,.0f}원)"
+            )
+            self.db.open_position("CRYPTO", market, current_price, qty,
+                                  stop_price, take_price, "DCA")
+            self.db.record_trade("CRYPTO", market, "DRY-BUY", current_price, qty,
+                                 fee=fee, strategy="DCA",
+                                 note=f"DCA#{dca_n} score:{cfg.get('score', 0):.0f}pt 가상잔고:{self.virtual_krw:,.0f}")
+            self._save_virtual_krw()
+        else:
+            result = self.upbit.buy_market_order(market, invest)
+            if result:
+                qty = invest / current_price
+                self.db.open_position("CRYPTO", market, current_price, qty,
+                                      stop_price, take_price, "DCA")
+                self.db.record_trade("CRYPTO", market, "BUY", current_price, qty,
+                                     strategy="DCA",
+                                     note=f"DCA#{dca_n} {cfg.get('score', 0):.0f}pt")
+                self._dca_count[market] = dca_n
+                logger.info(f"  [DCA-BUY #{dca_n}] {market} {invest:,.0f}원 @ {current_price:,.4f}")
+
+    # ─────────────────────────────────────────
     # 전체 시장 스캔 (1시간마다)
     # ─────────────────────────────────────────
     def run_market_scan(self):
@@ -209,6 +306,7 @@ class AutoTrader:
         # elif kr_time.hour >= 21 or kr_time.hour < 7:
         #     self._scan_us_stocks()
 
+        self._last_scan_time = datetime.now(KST)
         logger.info(f"[{now}] ════ 스캔 완료 ════")
 
     def _scan_crypto(self):
@@ -430,6 +528,22 @@ class AutoTrader:
             # 타겟도 포지션도 없으면 스캔 먼저
             logger.info(f"[{now}] 코인 타겟 없음 → 스캔 실행")
             self._scan_crypto()
+            self._last_scan_time = datetime.now(KST)
+
+        # ── 가용 현금 최대 활용: 슬롯 남고 현금 충분하면 즉시 재스캔 ──
+        open_count      = len(self.db.get_positions())
+        avail_slots     = self.max_crypto - open_count
+        avail_krw       = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
+        last_scan       = self._last_scan_time
+        scan_age_sec    = (datetime.now(KST) - last_scan).total_seconds() if last_scan else 9999
+        if (avail_slots > 0
+                and avail_krw >= self.per_position_krw
+                and scan_age_sec > 600):   # 마지막 스캔 후 10분 이상 경과 시에만
+            logger.info(
+                f"  [현금활용] 빈 슬롯 {avail_slots}개 | 가용 {avail_krw:,.0f}원 → 즉시 재스캔"
+            )
+            self._scan_crypto()
+            self._last_scan_time = datetime.now(KST)
 
         # 국내주식 / 미국주식 비활성화 (코인 전략 집중)
         # if is_kr_market_open(): ...
@@ -481,6 +595,14 @@ class AutoTrader:
                 except Exception:
                     pass
 
+                # ── 분할 익절: +5% 도달 (30초 모니터에서 빠른 체크) ──
+                if ret >= self._partial_exit_pct and market not in self._partial_sold:
+                    self._do_partial_sell(
+                        market, current_price, p,
+                        f"+{self._partial_exit_pct:.0%} 분할익절(모니터)"
+                    )
+                    continue  # 나머지 수량은 이후 루프에서 트레일링으로 관리
+
                 sell_reason = ""
                 if current_price <= trailing_stop and ret > -sl:
                     sell_reason = f"트레일링스탑 ({ret:+.2%})"
@@ -505,12 +627,13 @@ class AutoTrader:
                         )
                         self.db.close_position("CRYPTO", market)
                         self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
-                                             strategy="PositionMonitor",
+                                             fee=sell_fee, strategy="PositionMonitor",
                                              note=f"{sell_reason} pnl:{pnl:+,.0f}")
                         self.risk.record_trade_result(pnl)
                         self._save_virtual_krw()
                         self._max_price.pop(market, None)
-
+                        self._partial_sold.discard(market)
+                        self._dca_count.pop(market, None)
                         self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
                     else:
                         coin = market.split("-")[1]
@@ -519,9 +642,12 @@ class AutoTrader:
                             self.upbit.sell_market_order(market, bal)
                             self.db.close_position("CRYPTO", market)
                             self.db.record_trade("CRYPTO", market, "SELL", current_price, bal,
-                                                 strategy="PositionMonitor", note=sell_reason)
+                                                 fee=sell_fee, strategy="PositionMonitor",
+                                                 note=sell_reason)
                             self.risk.record_trade_result(pnl)
                             self._max_price.pop(market, None)
+                            self._partial_sold.discard(market)
+                            self._dca_count.pop(market, None)
                             logger.info(f"  [FAST-SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
             except Exception as e:
                 logger.error(f"[포지션모니터] {market} 오류: {e}")
@@ -546,6 +672,7 @@ class AutoTrader:
 
         position = self.db.get_position("CRYPTO", market)
 
+        # ── 신규 매수: BUY 신호 + 포지션 없음 ──
         if signal.signal == Signal.BUY and not position:
             # 쿨다운 체크: 최근 매도 종목은 재매수 대기
             cooldown_until = self._cooldown.get(market)
@@ -554,12 +681,7 @@ class AutoTrader:
                 logger.info(f"  [{market}] 쿨다운 중 ({remain}분 후 재매수 가능)")
                 return
 
-            # Dry Run: 가상 잔고 사용 / 실전: 실제 업비트 잔고
-            if self.dry_run:
-                krw = self.virtual_krw
-            else:
-                krw = self.upbit.get_krw_balance()
-            # 포지션당 고정 투자금 사용 (가용 잔고 내에서)
+            krw    = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
             invest = min(self.per_position_krw, krw * 0.95)
             if invest < 5000:
                 logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원, 필요:5,000원)")
@@ -569,24 +691,22 @@ class AutoTrader:
             take_price = current_price * (1 + tp)
 
             if self.dry_run:
-                fee   = invest * FEE_CRYPTO_BUY          # 매수 수수료
-                total = invest + fee                      # 실제 차감액 = 투자금 + 수수료
-                self.virtual_krw -= total
-                qty   = invest / current_price           # 수수료 제외한 실제 매수 수량
+                fee              = invest * FEE_CRYPTO_BUY
+                self.virtual_krw -= invest + fee
+                qty              = invest / current_price
                 logger.info(
                     f"  [DRY-BUY]  {market} | "
-                    f"가격:{current_price:>14,.0f} | 금액:{invest:>8,.0f}원 | "
+                    f"가격:{current_price:>14,.4f} | 금액:{invest:>8,.0f}원 | "
                     f"수수료:{fee:,.0f}원 | "
-                    f"손절:{stop_price:>14,.0f} | 익절:{take_price:>14,.0f} | "
+                    f"손절:{stop_price:>14,.4f} | 익절:{take_price:>14,.4f} | "
                     f"패턴점수:{cfg['score']:.0f}pt (가상잔고:{self.virtual_krw:,.0f}원)"
                 )
-                # Dry Run: DB에 포지션 + 거래 기록 모두 저장
                 self.db.open_position("CRYPTO", market, current_price, qty,
                                       stop_price, take_price, "PatternStrategy")
                 self.db.record_trade("CRYPTO", market, "DRY-BUY", current_price, qty,
-                                     strategy="PatternStrategy",
+                                     fee=fee, strategy="PatternStrategy",
                                      note=f"패턴:{cfg['score']:.0f}pt fee:{fee:,.0f} 가상잔고:{self.virtual_krw:,.0f}")
-                self._max_price[market] = current_price  # 최고가 초기화
+                self._max_price[market] = current_price
                 self._save_virtual_krw()
             else:
                 result = self.upbit.buy_market_order(market, invest)
@@ -597,87 +717,122 @@ class AutoTrader:
                     self.db.record_trade("CRYPTO", market, "BUY", current_price, qty,
                                          strategy=strategy.name,
                                          note=f"AI:{cfg['score']:.0f}pt")
-                    logger.info(f"  [BUY]  {market} {invest:,.0f}원 @ {current_price:,.0f}")
+                    logger.info(f"  [BUY]  {market} {invest:,.0f}원 @ {current_price:,.4f}")
+            return
 
-        elif position:
-            entry  = float(position["entry_price"])
-            qty    = float(position["quantity"])
-            stop_p = float(position.get("stop_loss") or entry * (1 - sl))
-            take_p = float(position.get("take_profit") or entry * (1 + tp))
-            ret    = (current_price - entry) / entry
+        # ── 포지션 없고 BUY 신호도 아님 → 스킵 ──
+        if not position:
+            return
 
-            # 트레일링 스탑: 최고가 갱신 및 추적
-            prev_max = self._max_price.get(market, entry)
-            if current_price > prev_max:
-                self._max_price[market] = current_price
-                prev_max = current_price
-            trailing_stop = prev_max * (1 - self._trailing_pct)
+        # ── 포지션 있음: 공통 변수 계산 ──
+        entry  = float(position["entry_price"])
+        qty    = float(position["quantity"])
+        stop_p = float(position.get("stop_loss") or entry * (1 - sl))
+        take_p = float(position.get("take_profit") or entry * (1 + tp))
+        ret    = (current_price - entry) / entry
 
-            # 시간 기반 탈출: 보유일 계산
-            days_held = 0
-            try:
+        # 트레일링 스탑 갱신
+        prev_max = self._max_price.get(market, entry)
+        if current_price > prev_max:
+            self._max_price[market] = current_price
+            prev_max = current_price
+        trailing_stop = prev_max * (1 - self._trailing_pct)
 
-                entry_date = datetime.strptime(
-                    position.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=KST)
-                days_held = (datetime.now(KST) - entry_date).days
-            except Exception:
-                pass
+        # 보유일 계산
+        days_held = 0
+        try:
+            entry_date = datetime.strptime(
+                position.get("entry_date", ""), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=KST)
+            days_held = (datetime.now(KST) - entry_date).days
+        except Exception:
+            pass
 
-            sell_reason = ""
-            if current_price <= trailing_stop and ret > -sl:
-                sell_reason = f"트레일링스탑 ({ret:+.2%}, 최고가대비-{self._trailing_pct:.0%})"
-            elif current_price <= stop_p:
-                sell_reason = f"고정손절 ({ret:+.2%})"
-            elif current_price >= take_p:
-                sell_reason = f"익절 ({ret:+.2%})"
-            elif signal.signal == Signal.SELL:
-                sell_reason = f"패턴매도 ({ret:+.2%})"
-            elif days_held >= self._time_exit_days and ret < 0:
-                sell_reason = f"시간탈출 ({days_held}일보유, {ret:+.2%})"
-
-            if sell_reason:
-                gross_pnl = (current_price - entry) * qty  # 수수료 전 손익
-                sell_fee  = current_price * qty * FEE_CRYPTO_SELL  # 매도 수수료
-                pnl       = gross_pnl - sell_fee            # 수수료 반영 실현 손익
-                if self.dry_run:
-                    self.virtual_krw += entry * qty + gross_pnl - sell_fee  # 수수료 차감 후 복구
-                    logger.info(
-                        f"  [DRY-SELL] {market} | "
-                        f"가격:{current_price:>14,.0f} | "
-                        f"수수료:{sell_fee:,.0f}원 | 손익:{pnl:>+10,.0f}원 | {sell_reason} "
-                        f"(가상잔고:{self.virtual_krw:,.0f}원)"
-                    )
-                    self.db.close_position("CRYPTO", market)
-                    self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
-                                         strategy="PatternStrategy",
-                                         note=f"{sell_reason} fee:{sell_fee:,.0f} pnl:{pnl:+,.0f}")
-                    self.risk.record_trade_result(pnl)
-                    self._save_virtual_krw()
-                    self._max_price.pop(market, None)  # 최고가 초기화
-
-                    self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
-                    logger.info(f"  [{market}] 쿨다운 시작 ({self._cooldown_minutes}분)")
-                else:
-                    coin = market.split("-")[1]
-                    bal  = self.upbit.get_coin_balance(coin)
-                    if bal > 0:
-                        self.upbit.sell_market_order(market, bal)
-                        self.db.close_position("CRYPTO", market)
-                        self.db.record_trade("CRYPTO", market, "SELL",
-                                              current_price, bal,
-                                              strategy=strategy.name, note=sell_reason)
-                        self.risk.record_trade_result(pnl)
-                        logger.info(f"  [SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
-
-                        self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
-                        self._max_price.pop(market, None)
+        # ── BUY 신호 재발생 → DCA 검토 ──
+        if signal.signal == Signal.BUY:
+            dca_done        = self._dca_count.get(market, 0)
+            drop_from_entry = (entry - current_price) / entry  # 양수 = 하락
+            avail_krw       = self.virtual_krw if self.dry_run else self.upbit.get_krw_balance()
+            can_dca = (
+                dca_done < self._dca_max
+                and self._dca_drop_min <= drop_from_entry <= self._dca_drop_max
+                and avail_krw >= self.per_position_krw * 0.5
+            )
+            if can_dca:
+                self._do_dca_buy(market, current_price, position, cfg)
             else:
                 logger.info(
-                    f"  [HOLD] {market} | "
-                    f"현재:{current_price:>14,.0f} | 수익률:{ret:>+7.2%} | "
-                    f"트레일:{trailing_stop:>14,.0f} | {days_held}일보유"
+                    f"  [HOLD] {market} | 현재:{current_price:>14,.4f} | "
+                    f"수익률:{ret:>+7.2%} | DCA조건미충족 "
+                    f"(drop:{drop_from_entry:+.2%} dca:{dca_done}/{self._dca_max})"
                 )
+            return  # BUY 신호이므로 매도 조건 검토 안 함
+
+        # ── 분할 익절: +5% 도달 시 50% 매도 (최초 1회) ──
+        if ret >= self._partial_exit_pct and market not in self._partial_sold:
+            self._do_partial_sell(
+                market, current_price, position,
+                f"+{self._partial_exit_pct:.0%} 분할익절 (나머지 트레일링)"
+            )
+            return  # 나머지는 트레일링 스탑으로 관리
+
+        # ── 전량 매도 조건 ──
+        sell_reason = ""
+        if current_price <= trailing_stop and ret > -sl:
+            sell_reason = f"트레일링스탑 ({ret:+.2%}, 최고가대비-{self._trailing_pct:.0%})"
+        elif current_price <= stop_p:
+            sell_reason = f"고정손절 ({ret:+.2%})"
+        elif current_price >= take_p:
+            sell_reason = f"익절 ({ret:+.2%})"
+        elif signal.signal == Signal.SELL:
+            sell_reason = f"패턴매도 ({ret:+.2%})"
+        elif days_held >= self._time_exit_days and ret < 0:
+            sell_reason = f"시간탈출 ({days_held}일보유, {ret:+.2%})"
+
+        if sell_reason:
+            gross_pnl = (current_price - entry) * qty
+            sell_fee  = current_price * qty * FEE_CRYPTO_SELL
+            pnl       = gross_pnl - sell_fee
+            if self.dry_run:
+                self.virtual_krw += entry * qty + gross_pnl - sell_fee
+                logger.info(
+                    f"  [DRY-SELL] {market} | "
+                    f"가격:{current_price:>14,.4f} | "
+                    f"수수료:{sell_fee:,.0f}원 | 손익:{pnl:>+10,.0f}원 | {sell_reason} "
+                    f"(가상잔고:{self.virtual_krw:,.0f}원)"
+                )
+                self.db.close_position("CRYPTO", market)
+                self.db.record_trade("CRYPTO", market, "DRY-SELL", current_price, qty,
+                                     fee=sell_fee, strategy="PatternStrategy",
+                                     note=f"{sell_reason} fee:{sell_fee:,.0f} pnl:{pnl:+,.0f}")
+                self.risk.record_trade_result(pnl)
+                self._save_virtual_krw()
+                self._max_price.pop(market, None)
+                self._partial_sold.discard(market)   # 분할매도 플래그 초기화
+                self._dca_count.pop(market, None)    # DCA 횟수 초기화
+                self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
+                logger.info(f"  [{market}] 쿨다운 시작 ({self._cooldown_minutes}분)")
+            else:
+                coin = market.split("-")[1]
+                bal  = self.upbit.get_coin_balance(coin)
+                if bal > 0:
+                    self.upbit.sell_market_order(market, bal)
+                    self.db.close_position("CRYPTO", market)
+                    self.db.record_trade("CRYPTO", market, "SELL",
+                                          current_price, bal,
+                                          fee=sell_fee, strategy=strategy.name, note=sell_reason)
+                    self.risk.record_trade_result(pnl)
+                    self._max_price.pop(market, None)
+                    self._partial_sold.discard(market)
+                    self._dca_count.pop(market, None)
+                    self._cooldown[market] = datetime.now(KST) + timedelta(minutes=self._cooldown_minutes)
+                    logger.info(f"  [SELL] {market} {sell_reason} | 손익:{pnl:+,.0f}원")
+        else:
+            logger.info(
+                f"  [HOLD] {market} | "
+                f"현재:{current_price:>14,.4f} | 수익률:{ret:>+7.2%} | "
+                f"트레일:{trailing_stop:>14,.4f} | {days_held}일보유"
+            )
 
     def _process_kr_stock(self, cfg: dict):
         code, name = cfg["code"], cfg["name"]
