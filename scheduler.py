@@ -141,7 +141,7 @@ class AutoTrader:
 
         # 쿨다운: 매도 후 동일 종목 재매수 방지 (symbol → 마지막 매도 시각)
         self._cooldown: dict = {}   # {"KRW-MON": datetime}
-        self._cooldown_minutes = 20  # 매도 후 20분 쿨다운 (공격적 모드)
+        self._cooldown_minutes = 30  # 매도 후 30분 쿨다운 (동일 종목 재매수 방지 강화)
 
         # 트레일링 스탑: 보유 중 최고가 추적 {market: max_price}
         self._max_price: dict = {}
@@ -431,7 +431,14 @@ class AutoTrader:
         pattern_strat = PatternStrategy(buy_score_threshold=45.0)
 
         for market, info in top10:
+            # 이미 포지션 있으면 스킵
             if self.db.get_position("CRYPTO", market):
+                continue
+            # 쿨다운 직접 체크 (모멘텀 스캐너가 쿨다운 종목을 뚫는 버그 방지)
+            cooldown_until = self._cooldown.get(market)
+            if cooldown_until and datetime.now(KST) < cooldown_until:
+                remain = int((cooldown_until - datetime.now(KST)).total_seconds() / 60)
+                logger.info(f"  [핫스캔] {market} 쿨다운 중 ({remain}분 후 재검토)")
                 continue
             cfg = {
                 "market":    market,
@@ -439,7 +446,7 @@ class AutoTrader:
                 "strategy":  pattern_strat,
                 "stop_loss":   0.05,
                 "take_profit": 0.08,
-                "score":     abs(info["momentum"]) * 100,  # 모멘텀 크기를 점수로 활용
+                "score":     abs(info["momentum"]) * 100,
                 "capital":   0,
             }
             try:
@@ -845,14 +852,16 @@ class AutoTrader:
             # 확신도 비례 투자: 점수 높을수록 더 많이 투자
             score = cfg.get("score", 0)
             if score >= 70:
-                conviction = 1.3   # 강한 신호 → 30% 추가 투자
+                conviction = 1.1   # 강한 신호 → 10% 추가 (기존 1.3 → 과도한 집중 방지)
             elif score >= 55:
                 conviction = 1.0   # 표준
             else:
                 conviction = 0.8   # 약한 신호 → 20% 절감
 
             invest = max(dynamic_invest * conviction, self.per_position_krw)
-            invest = min(invest, krw * 0.95)
+            # 단일 거래 최대 금액: 가용 현금의 40% 이하 (과도한 올인 방지)
+            max_single_invest = krw * 0.40
+            invest = min(invest, max_single_invest, krw * 0.95)
 
             if invest < 5000:
                 logger.info(f"  [{market}] 잔고 부족 (가용:{krw:,.0f}원, 필요:5,000원)")
