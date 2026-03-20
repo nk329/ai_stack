@@ -35,10 +35,9 @@
 | 오픈 포지션 | 진입가 / **현재가** / **미실현 손익** / 수익률 / 손절가 / 익절가 |
 | 거래 내역 | 전체 매수·매도 기록 및 손익 |
 
-> 📷 스크린샷을 이 위치에 추가하세요: `docs/screenshot_dashboard.png`
-> ```markdown
-> ![대시보드](docs/screenshot_dashboard.png)
-> ```
+![대시보드 메인](docs/screenshot_dashboard.png)
+
+![대시보드 상세](docs/screenshot_dashboard2.png)
 
 ---
 
