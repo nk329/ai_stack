@@ -105,7 +105,7 @@ class AutoTrader:
     """AI 자동매매 - 실시간 모니터링 버전"""
 
     def __init__(self, dry_run: bool = True,
-                 max_crypto: int = 10,  # 코인 최대 10개
+                 max_crypto: int = 7,   # 코인 최대 7개 (집중 투자)
                  max_kr: int = 5,
                  max_us: int = 3,
                  signal_interval: int = 3):   # 신호 체크 주기 (분)
@@ -125,10 +125,10 @@ class AutoTrader:
 
         # 포트폴리오 관리자
         # total_capital을 크게 잡고 포지션당 실제 투자금은 virtual_krw로 동적 결정
-        self.per_position_krw = 5000   # 포지션당 투자금 (원) - 가용 잔고에서 이 금액씩 투자
+        self.per_position_krw = 12000  # 포지션당 투자금 (원) - 최대 7개 × 12,000 = 84,000원 투자
         large_cap = INITIAL_CAPITAL * 10  # 할당 계산용 (실제 투자금은 per_position_krw 기준)
         self.crypto_portfolio = DynamicPortfolio(
-            total_capital=large_cap, max_positions=max_crypto, min_score=25.0)
+            total_capital=large_cap, max_positions=max_crypto, min_score=40.0)
         self.kr_portfolio = DynamicPortfolio(
             total_capital=large_cap, max_positions=max_kr, min_score=25.0)
         self.us_portfolio = DynamicPortfolio(
