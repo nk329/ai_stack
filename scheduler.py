@@ -152,8 +152,8 @@ class AutoTrader:
 
         # ── 분할 매도 3단계 설정 ──
         self._partial_stage: dict  = {}       # {market: 0/1/2} 단계 추적
-        self._partial_exit_1_pct: float = 0.03  # +3%: 보유수량 30% 매도 (1단계)
-        self._partial_exit_2_pct: float = 0.05  # +5%: 남은수량 50% 매도 (2단계)
+        self._partial_exit_1_pct: float = 0.02  # +2%: 보유수량 40% 매도 (1단계)
+        self._partial_exit_2_pct: float = 0.03  # +3%: 남은수량 50% 매도 (2단계)
         # 나머지는 트레일링 스탑으로 관리 (3단계)
 
         # ── 추가 매수 (DCA) 설정 ──
@@ -445,7 +445,7 @@ class AutoTrader:
                 "name":      market,
                 "strategy":  pattern_strat,
                 "stop_loss":   0.05,
-                "take_profit": 0.08,
+                "take_profit": 0.05,
                 "score":     abs(info["momentum"]) * 100,
                 "capital":   0,
             }
@@ -629,7 +629,7 @@ class AutoTrader:
                 "name":     s.name,
                 "strategy": pattern_strat,
                 "stop_loss":   0.05,   # 고정 손절 5% (트레일링 스탑과 병행)
-                "take_profit": 0.08,   # 익절 8%
+                "take_profit": 0.05,   # 익절 5%
                 "score":   s.score,
                 "capital": allocation.get(s.symbol, 0),
             }
@@ -661,7 +661,7 @@ class AutoTrader:
                 "name":        sym,
                 "strategy":    pattern_strat,
                 "stop_loss":   0.05,
-                "take_profit": 0.08,
+                "take_profit": 0.05,
                 "score":       0,
                 "capital":     0,
             }
@@ -753,7 +753,7 @@ class AutoTrader:
                     self._do_partial_sell(
                         market, current_price, p,
                         f"+{self._partial_exit_1_pct:.0%} 1단계분할익절(모니터)",
-                        sell_ratio=0.30, stage=1
+                        sell_ratio=0.40, stage=1
                     )
                     continue
                 if mon_stage < 2 and ret >= self._partial_exit_2_pct:
@@ -955,7 +955,7 @@ class AutoTrader:
             # 1단계: +3% → 보유수량 30% 매도
             self._do_partial_sell(
                 market, current_price, position,
-                f"+{self._partial_exit_1_pct:.0%} 1단계분할익절", sell_ratio=0.30, stage=1
+                f"+{self._partial_exit_1_pct:.0%} 1단계분할익절", sell_ratio=0.40, stage=1
             )
             return
         if stage < 2 and ret >= self._partial_exit_2_pct:
