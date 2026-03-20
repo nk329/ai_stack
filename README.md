@@ -42,26 +42,9 @@
 
 ---
 
-##  시스템 아키텍처
+## ⚙️ 시스템 아키텍처
 
-```
-graph TD
-    subgraph Scheduler [Main Orchestrator: scheduler.py]
-        S1[포지션 모니터 - 30초]
-        S2[신호 체크 - 3분]
-        S3[전체 시장 스캔 - 60분]
-    end
-
-    S1 --> API[Upbit API: 현재가 조회/주문]
-    S2 --> Strategy[전략 엔진: PatternStrat, RSI+BB 복합]
-    S3 --> Screening[스크리닝 엔진: KRW 코인 점수 산출]
-
-    API --> DB[(SQLite DB: trades/positions)]
-    Strategy --> DB
-    Screening --> DB
-
-    DB --> Flask[Flask 대시보드: 외부 IP 접속/인증]
-```
+![시스템 아키텍처](docs/system_architecture.png)
 
 ---
 
