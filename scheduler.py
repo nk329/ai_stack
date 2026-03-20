@@ -128,7 +128,7 @@ class AutoTrader:
         self.per_position_krw = 12000  # 포지션당 투자금 (원) - 최대 7개 × 12,000 = 84,000원 투자
         large_cap = INITIAL_CAPITAL * 10  # 할당 계산용 (실제 투자금은 per_position_krw 기준)
         self.crypto_portfolio = DynamicPortfolio(
-            total_capital=large_cap, max_positions=max_crypto, min_score=40.0)
+            total_capital=large_cap, max_positions=max_crypto, min_score=25.0)  # 25점으로 낮춰 더 많은 후보 선발
         self.kr_portfolio = DynamicPortfolio(
             total_capital=large_cap, max_positions=max_kr, min_score=25.0)
         self.us_portfolio = DynamicPortfolio(
@@ -213,7 +213,7 @@ class AutoTrader:
 
     def _scan_crypto(self):
         logger.info("  [코인] 전체 KRW 코인 스캔...")
-        scores = self.screener.scan_crypto(top_n=self.max_crypto + 3)
+        scores = self.screener.scan_crypto(top_n=self.max_crypto + 5)  # 후보풀 확대 (max+5)
         self.crypto_portfolio.update_scores(scores)
         actions    = self.crypto_portfolio.get_rebalance_actions()
         allocation = self.crypto_portfolio.calculate_allocation(actions)
